@@ -383,8 +383,8 @@ impl SchemaCompatibility {
                     }
 
                     return Err(CompatibilityError::NameMismatch {
-                        writer_name: writers_name.name.clone(),
-                        reader_name: readers_name.name.clone(),
+                        writer_name: writers_name.name.clone().into_owned(),
+                        reader_name: readers_name.name.clone().into_owned(),
                     });
                 }
                 SchemaKind::Fixed => {

@@ -52,7 +52,8 @@ impl SchemaNameValidator for SpecificationValidator {
             .ok_or_else(|| Error::InvalidSchemaName(schema_name.to_string(), regex.as_str()))?;
         Ok((
             caps["name"].to_string(),
-            caps.name("namespace").map(|s| s.as_str().to_string()),
+            caps.name("namespace")
+                .map(|s| s.as_str().to_string().into()),
         ))
     }
 }

@@ -34,7 +34,7 @@ use serde::{
 };
 use serde_json::{Map, Value};
 use std::{
-    borrow::Borrow,
+    borrow::{Borrow, Cow},
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
     fmt::Debug,
@@ -231,7 +231,7 @@ impl From<&types::Value> for SchemaKind {
 /// [Avro specification](https://avro.apache.org/docs/current/specification/#names)
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Name {
-    pub name: String,
+    pub name: Cow<'static, str>,
     pub namespace: Namespace,
 }
 
@@ -244,7 +244,7 @@ pub(crate) type Names = HashMap<Name, Schema>;
 /// Represents Schema lookup within a schema
 pub type NamesRef<'a> = HashMap<Name, &'a Schema>;
 /// Represents the namespace for Named Schema
-pub type Namespace = Option<String>;
+pub type Namespace = Option<Cow<'static, str>>;
 
 impl Name {
     /// Create a new `Name`.
@@ -253,7 +253,7 @@ impl Name {
     pub fn new(name: &str) -> AvroResult<Self> {
         let (name, namespace) = Name::get_name_and_namespace(name)?;
         Ok(Self {
-            name,
+            name: name.into(),
             namespace: namespace.filter(|ns| !ns.is_empty()),
         })
     }
@@ -281,6 +281,7 @@ impl Name {
             .or_else(|| {
                 complex
                     .string("namespace")
+                    .map(Cow::from)
                     .or_else(|| enclosing_namespace.clone())
             })
             .filter(|ns| !ns.is_empty());
@@ -290,7 +291,7 @@ impl Name {
         }
 
         Ok(Self {
-            name: type_name.unwrap_or(name),
+            name: type_name.unwrap_or(name).into(),
             namespace,
         })
     }
@@ -301,7 +302,7 @@ impl Name {
     /// [Avro specification](https://avro.apache.org/docs/current/specification/#names)
     pub fn fullname(&self, default_namespace: Namespace) -> String {
         if self.name.contains('.') {
-            self.name.clone()
+            self.name.clone().into_owned()
         } else {
             let namespace = self.namespace.clone().or(default_namespace);
 
@@ -309,7 +310,7 @@ impl Name {
                 Some(ref namespace) if !namespace.is_empty() => {
                     format!("{}.{}", namespace, self.name)
                 }
-                _ => self.name.clone(),
+                _ => self.name.clone().into_owned(),
             }
         }
     }
@@ -377,7 +378,7 @@ impl Alias {
     }
 
     pub fn name(&self) -> String {
-        self.0.name.clone()
+        self.0.name.clone().into_owned()
     }
 
     pub fn namespace(&self) -> Namespace {
@@ -1421,7 +1422,7 @@ impl Parser {
         }
 
         // For good error reporting we add this check
-        match name.name.as_str() {
+        match name.name.as_ref() {
             "record" | "enum" | "fixed" => {
                 return Err(Error::InvalidSchemaRecord(name.to_string()));
             }
@@ -1575,9 +1576,7 @@ impl Parser {
                                 Ok(schema)
                             }
                             _ => {
-                                warn!(
-                                    "Ignoring invalid uuid logical type for schema: {schema:?}"
-                                );
+                                warn!("Ignoring invalid uuid logical type for schema: {schema:?}");
                                 Ok(schema)
                             }
                         },
@@ -2726,7 +2725,7 @@ mod tests {
                 Schema::Null,
                 Schema::Ref {
                     name: Name {
-                        name: "LongList".to_owned(),
+                        name: "LongList".into(),
                         namespace: None,
                     },
                 },
@@ -3296,7 +3295,7 @@ mod tests {
 
         let expected = Schema::Record(RecordSchema {
             name: Name {
-                name: "LongList".to_owned(),
+                name: "LongList".into(),
                 namespace: None,
             },
             aliases: Some(vec![Alias::new("LinkedLongs").unwrap()]),
@@ -3321,7 +3320,7 @@ mod tests {
                         Schema::Null,
                         Schema::Ref {
                             name: Name {
-                                name: "LongList".to_owned(),
+                                name: "LongList".into(),
                                 namespace: None,
                             },
                         },
@@ -3364,7 +3363,7 @@ mod tests {
 
         let expected = Schema::Record(RecordSchema {
             name: Name {
-                name: "record".to_owned(),
+                name: "record".into(),
                 namespace: None,
             },
             aliases: None,
@@ -3387,7 +3386,7 @@ mod tests {
                     aliases: None,
                     schema: Schema::Ref {
                         name: Name {
-                            name: "record".to_owned(),
+                            name: "record".into(),
                             namespace: None,
                         },
                     },
@@ -3433,7 +3432,7 @@ mod tests {
 
         let expected = Schema::Record(RecordSchema {
             name: Name {
-                name: "record".to_owned(),
+                name: "record".into(),
                 namespace: None,
             },
             aliases: None,
@@ -3465,7 +3464,7 @@ mod tests {
                     aliases: None,
                     schema: Schema::Enum(EnumSchema {
                         name: Name {
-                            name: "enum".to_owned(),
+                            name: "enum".into(),
                             namespace: None,
                         },
                         aliases: None,
@@ -3516,7 +3515,7 @@ mod tests {
 
         let expected = Schema::Record(RecordSchema {
             name: Name {
-                name: "record".to_owned(),
+                name: "record".into(),
                 namespace: None,
             },
             aliases: None,
@@ -3529,7 +3528,7 @@ mod tests {
                     aliases: None,
                     schema: Schema::Fixed(FixedSchema {
                         name: Name {
-                            name: "fixed".to_owned(),
+                            name: "fixed".into(),
                             namespace: None,
                         },
                         aliases: None,
@@ -3549,7 +3548,7 @@ mod tests {
                     aliases: None,
                     schema: Schema::Fixed(FixedSchema {
                         name: Name {
-                            name: "fixed".to_owned(),
+                            name: "fixed".into(),
                             namespace: None,
                         },
                         aliases: None,
@@ -3861,7 +3860,7 @@ mod tests {
         let schema = Schema::parse_str(schema)?;
         if let Schema::Record(RecordSchema { name, .. }) = schema {
             assert_eq!(name.name, "name");
-            assert_eq!(name.namespace, Some("space".to_string()));
+            assert_eq!(name.namespace, Some("space".into()));
         } else {
             panic!("Expected a record schema!");
         }
@@ -3887,7 +3886,7 @@ mod tests {
 
         let schema = Schema::parse_str(schema)?;
         if let Schema::Record(RecordSchema { name, .. }) = schema {
-            assert_eq!(name.namespace, Some("space1".to_string()));
+            assert_eq!(name.namespace, Some("space1".into()));
         } else {
             panic!("Expected a record schema!");
         }
@@ -3913,7 +3912,7 @@ mod tests {
 
         let schema = Schema::parse_str(schema)?;
         if let Schema::Record(RecordSchema { name, .. }) = schema {
-            assert_eq!(name.namespace, Some("space2".to_string()));
+            assert_eq!(name.namespace, Some("space2".into()));
         } else {
             panic!("Expected a record schema!");
         }
@@ -5453,9 +5452,9 @@ mod tests {
         assert_eq!(canonical_form, expected);
 
         let name = Name::new("my_name")?;
-        let fullname = name.fullname(Some("".to_string()));
+        let fullname = name.fullname(Some("".into()));
         assert_eq!(fullname, "my_name");
-        let qname = name.fully_qualified_name(&Some("".to_string())).to_string();
+        let qname = name.fully_qualified_name(&Some("".into())).to_string();
         assert_eq!(qname, "my_name");
 
         Ok(())
@@ -6881,7 +6880,7 @@ mod tests {
             lookup.insert("value".to_owned(), 0);
             Schema::Record(RecordSchema {
                 name: Name {
-                    name: "LongList".to_owned(),
+                    name: "LongList".into(),
                     namespace: None,
                 },
                 aliases: Some(vec![Alias::new("LinkedLongs").unwrap()]),

@@ -390,9 +390,8 @@ impl Value {
 
             match self.validate_internal(schema, rs.get_names(), &enclosing_namespace) {
                 Some(reason) => {
-                    let log_message = format!(
-                        "Invalid value: {self:?} for schema: {schema:?}. Reason: {reason}"
-                    );
+                    let log_message =
+                        format!("Invalid value: {self:?} for schema: {schema:?}. Reason: {reason}");
                     if schemata_len == 1 {
                         error!("{log_message}");
                     } else {

@@ -71,7 +71,7 @@ fn test_correct_recursive_extraction() -> TestResult {
                 ..
             }) = &inner_fields[0].schema
             {
-                assert_eq!("X", recursive_type.name.as_str());
+                assert_eq!("X", &recursive_type.name);
             }
         } else {
             panic!("inner schema {inner_schema:?} should have been a record")
@@ -597,7 +597,7 @@ fn test_fullname_fullname_and_namespace_specified() -> TestResult {
     init();
     let name: Name = serde_json::from_str(r#"{"name": "a.b.c.d", "namespace": "o.a.h"}"#)?;
     assert_eq!(&name.name, "d");
-    assert_eq!(name.namespace, Some("a.b.c".to_owned()));
+    assert_eq!(name.namespace, Some("a.b.c".into()));
     let fullname = name.fullname(None);
     assert_eq!("a.b.c.d", fullname);
     Ok(())
@@ -619,7 +619,7 @@ fn test_fullname_fullname_and_default_namespace_specified() -> TestResult {
     init();
     let name: Name = serde_json::from_str(r#"{"name": "a.b.c.d", "namespace": null}"#)?;
     assert_eq!(&name.name, "d");
-    assert_eq!(name.namespace, Some("a.b.c".to_owned()));
+    assert_eq!(name.namespace, Some("a.b.c".into()));
     let fullname = name.fullname(Some("o.a.h".into()));
     assert_eq!("a.b.c.d", fullname);
     Ok(())
@@ -630,7 +630,7 @@ fn test_avro_3452_parsing_name_without_namespace() -> TestResult {
     init();
     let name: Name = serde_json::from_str(r#"{"name": "a.b.c.d"}"#)?;
     assert_eq!(&name.name, "d");
-    assert_eq!(name.namespace, Some("a.b.c".to_owned()));
+    assert_eq!(name.namespace, Some("a.b.c".into()));
     let fullname = name.fullname(None);
     assert_eq!("a.b.c.d", fullname);
     Ok(())
@@ -661,7 +661,7 @@ fn test_fullname_fullname_namespace_and_default_namespace_specified() -> TestRes
     let name: Name =
         serde_json::from_str(r#"{"name": "a.b.c.d", "namespace": "o.a.a", "aliases": null}"#)?;
     assert_eq!(&name.name, "d");
-    assert_eq!(name.namespace, Some("a.b.c".to_owned()));
+    assert_eq!(name.namespace, Some("a.b.c".into()));
     let fullname = name.fullname(Some("o.a.h".into()));
     assert_eq!("a.b.c.d", fullname);
     Ok(())
@@ -673,7 +673,7 @@ fn test_fullname_name_namespace_and_default_namespace_specified() -> TestResult 
     let name: Name =
         serde_json::from_str(r#"{"name": "a", "namespace": "o.a.a", "aliases": null}"#)?;
     assert_eq!(&name.name, "a");
-    assert_eq!(name.namespace, Some("o.a.a".to_owned()));
+    assert_eq!(name.namespace, Some("o.a.a".into()));
     let fullname = name.fullname(Some("o.a.h".into()));
     assert_eq!("o.a.a.a", fullname);
     Ok(())

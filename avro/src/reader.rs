@@ -241,9 +241,7 @@ impl<'r, R: Read> Block<'r, R> {
                 self.user_metadata.insert(key, vec.clone());
             }
             wrong => {
-                warn!(
-                    "User metadata values must be Value::Bytes, found {wrong:?}"
-                );
+                warn!("User metadata values must be Value::Bytes, found {wrong:?}");
             }
         }
     }
