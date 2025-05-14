@@ -391,13 +391,12 @@ impl Value {
             match self.validate_internal(schema, rs.get_names(), &enclosing_namespace) {
                 Some(reason) => {
                     let log_message = format!(
-                        "Invalid value: {:?} for schema: {:?}. Reason: {}",
-                        self, schema, reason
+                        "Invalid value: {self:?} for schema: {schema:?}. Reason: {reason}"
                     );
                     if schemata_len == 1 {
-                        error!("{}", log_message);
+                        error!("{log_message}");
                     } else {
-                        debug!("{}", log_message);
+                        debug!("{log_message}");
                     };
                     false
                 }
@@ -623,8 +622,7 @@ impl Value {
                 })
             }
             (v, s) => Some(format!(
-                "Unsupported value-schema combination! Value: {:?}, schema: {:?}",
-                v, s
+                "Unsupported value-schema combination! Value: {v:?}, schema: {s:?}"
             )),
         }
     }
@@ -678,10 +676,10 @@ impl Value {
                 let name = name.fully_qualified_name(enclosing_namespace);
 
                 if let Some(resolved) = names.get(&name) {
-                    debug!("Resolved {:?}", name);
+                    debug!("Resolved {name:?}");
                     self.resolve_internal(resolved.borrow(), names, &name.namespace, field_default)
                 } else {
-                    error!("Failed to resolve schema {:?}", name);
+                    error!("Failed to resolve schema {name:?}");
                     Err(Error::SchemaResolutionError(name.clone()))
                 }
             }

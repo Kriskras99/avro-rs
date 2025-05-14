@@ -1526,8 +1526,7 @@ impl Parser {
                 convert(schema)
             } else {
                 warn!(
-                    "Ignoring unknown logical type '{}' for schema of type: {:?}!",
-                    logical_type, schema
+                    "Ignoring unknown logical type '{logical_type}' for schema of type: {schema:?}!"
                 );
                 Ok(schema)
             }
@@ -1548,7 +1547,7 @@ impl Parser {
                                     inner: Box::new(inner),
                                 })),
                                 Err(err) => {
-                                    warn!("Ignoring invalid decimal logical type: {}", err);
+                                    warn!("Ignoring invalid decimal logical type: {err}");
                                     Ok(inner)
                                 }
                             }
@@ -1572,13 +1571,12 @@ impl Parser {
                             Schema::String => Ok(Schema::Uuid),
                             Schema::Fixed(FixedSchema { size: 16, .. }) => Ok(Schema::Uuid),
                             Schema::Fixed(FixedSchema { size, .. }) => {
-                                warn!("Ignoring uuid logical type for a Fixed schema because its size ({size:?}) is not 16! Schema: {:?}", schema);
+                                warn!("Ignoring uuid logical type for a Fixed schema because its size ({size:?}) is not 16! Schema: {schema:?}");
                                 Ok(schema)
                             }
                             _ => {
                                 warn!(
-                                    "Ignoring invalid uuid logical type for schema: {:?}",
-                                    schema
+                                    "Ignoring invalid uuid logical type for schema: {schema:?}"
                                 );
                                 Ok(schema)
                             }
