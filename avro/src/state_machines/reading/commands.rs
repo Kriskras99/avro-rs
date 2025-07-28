@@ -238,27 +238,141 @@ fn add_schema_to_tape(tape: &mut Vec<u8>, schema: &Schema, references: &mut Hash
         Schema::Bytes => tape.push(CommandTape::BYTES),
         Schema::String => tape.push(CommandTape::STRING),
         Schema::Array(ArraySchema { items, .. }) => {
-            if let Some(name) = items.name() && let Some((start, len)) = references.get(&name).copied() {
+            if let Some(name) = items.name() && let Some((offset, len)) = references.get(&name).copied() {
+                // The item schema was already serialized before
                 if len == 0 {
                     // An array of nulls?
-                    tape.push(CommandTape::BLOCK | (1u8 << 4));
-                    tape.push(CommandTape::REF | (0u8 << 4));
+                    tape.push(CommandTape::BLOCK);
                 } else if len <= 0xF {
+                    // Inline the value as it's small
                     tape.push(CommandTape::BLOCK | ((len as u8) << 4));
-                    tape.extend_from_within(start..(start + len));
+                    tape.extend_from_within(offset..(offset + len));
                 } else {
-
+                    // Too large to inline, insert a REF
+                    tape.push(CommandTape::BLOCK | 1 << 4);
+                    tape.push(CommandTape::REF);
+                    tape.extend_from_slice(&len.to_ne_bytes());
+                    tape.extend_from_slice(&offset.to_ne_bytes());
+                }
+            } else {
+                // The item schema has not been serialized yet, or is not a named schema
+                // As the schema might be arbitrarily large, we insert a SKIP with room for a length
+                // we can remove it if it turns out not to be necessary
+                let before = tape.len();
+                tape.push(CommandTape::SKIP);
+                tape.extend_from_slice(&0usize.to_ne_bytes());
+                // Make sure we know the offset of the schema
+                let schema_offset = tape.len();
+                // Serialize the schema to the tape
+                add_schema_to_tape(tape, schema, references)?;
+                // Calculate the size of the schema
+                let schema_len = tape.len() - schema_offset;
+                if schema_len {
+                    // An array of nulls?
+                    tape.truncate(before);
+                    tape.push(CommandTape::BLOCK);
+                } else if schema_len <= 0xF {
+                    // Small enough to inline, replace the SKIP with the BLOCK and remove the 8 length
+                    // bytes after SKIP
+                    tape[before] = CommandTape::BLOCK | ((schema_len as u8) << 4);
+                    tape.copy_within(before + 8..tape.len(), before + 1);
+                    // Update the reference if it was added
+                    if let Some(name) = items.name() {
+                        references.get_mut(&name).expect("Name exists").0 = before + 1;
+                    }
+                } else {
+                    // Too large to inline, update the SKIP with the correct len
+                    tape[before + 1..before + 9].copy_from_slice(&schema_len.to_ne_bytes());
+                    // Add the BLOCK and REF
+                    tape.push(CommandTape::BLOCK | 1 << 4);
+                    tape.push(CommandTape::REF);
+                    tape.copy_from_slice(&schema_len.to_ne_bytes());
+                    tape.copy_from_slice(&schema_offset.to_ne_bytes());
+                }
+            }
+        },
+        Schema::Map(MapSchema { types, ..}) => {
+            if let Some(name) = types.name() && let Some((offset, len)) = references.get(&name).copied() {
+                // The type schema was already serialized before
+                if len == 0 {
+                    // A map of nulls, so a set?
+                    tape.push(CommandTape::BLOCK | 1 << 4);
+                    tape.push(CommandTape::STRING);
+                } else if len < 0xF {
+                    // Inline the value as it's small
+                    tape.push(CommandTape::BLOCK | (((len + 1) as u8) << 4));
+                    tape.push(CommandTape::STRING);
+                    tape.extend_from_within(offset..(offset + len));
+                } else {
+                    // Too large to inline, insert a REF
+                    tape.push(CommandTape::BLOCK | 2 << 4);
+                    tape.push(CommandTape::STRING);
+                    // Without the STRING the size might fit inline in the REF
+                    if len <= 0xF {
+                        tape.push(CommandTape::REF | (len as u8) << 4);
+                    } else {
+                        tape.extend_from_slice(&len.to_ne_bytes());
+                    }
+                    tape.extend_from_slice(&offset.to_ne_bytes());
+                }
+            } else {
+                // The types schema has not been serialized yet, or is not a named schema
+                // As the schema might be arbitrarily large, we insert a SKIP with room for a length
+                // we can remove it if it turns out not to be necessary
+                let before = tape.len();
+                tape.push(CommandTape::SKIP);
+                tape.extend_from_slice(&0usize.to_ne_bytes());
+                // Make sure we know the offset of the schema
+                let schema_offset = tape.len();
+                // Serialize the schema to the tape
+                add_schema_to_tape(tape, schema, references)?;
+                // Calculate the size of the schema
+                let schema_len = tape.len() - schema_offset;
+                if schema_len {
+                    // A map of nulls, so a set?
+                    tape.truncate(before);
+                    tape.push(CommandTape::BLOCK | (1 << 4));
+                    tape.push(CommandTape::STRING);
+                } else if schema_len < 0xF {
+                    // Small enough to inline, replace the SKIP with the BLOCK and remove the 8 length
+                    // bytes after SKIP
+                    tape[before] = CommandTape::BLOCK | ((schema_len + 1 as u8) << 4);
+                    tape[before + 1] = CommandTape::STRING;
+                    tape.copy_within(before + 8..tape.len(), before + 2);
+                    // Update the reference if it was added
+                    if let Some(name) = types.name() {
+                        references.get_mut(&name).expect("Name exists").0 = before + 2;
+                    }
+                } else {
+                    // Too large to inline, update the SKIP with the correct len
+                    tape[before + 1..before + 9].copy_from_slice(&schema_len.to_ne_bytes());
+                    // Add the BLOCK and REF
+                    tape.push(CommandTape::BLOCK | 2 << 4);
+                    tape.push(CommandTape::STRING);
+                    // Without the STRING the size might fit inline in the REF
+                    if schema_len <= 0xF {
+                        tape.push(CommandTape::REF | ((schema_len as u8) << 4));
+                    } else {
+                        tape.push(CommandTape::REF);
+                        tape.copy_from_slice(&schema_len.to_ne_bytes());
+                    }
+                    tape.copy_from_slice(&schema_offset.to_ne_bytes());
+                }
+            }
+        },
+        Schema::Union(UnionSchema { schemas, ..}) => {
+            let variants = schemas.len();
+            let mut schema_refs = Vec::with_capacity(variants);
+            for schema in schemas {
+                if let Some(name) = schema.name() && let Some(reference) = references.get(name).copied() {
+                    schema_refs.push(reference);
+                } else {
+                    todo!();
                 }
             }
             todo!()
         },
-        Schema::Map(MapSchema { types, ..}) => {
-            todo!()
-        },
-        Schema::Union(UnionSchema { schemas, ..}) => {
-            todo!()
-        },
-        Schema::Record(RecordSchema { fields, ..}) => {
+        Schema::Record(RecordSchema { fields, name, ..}) => {
             todo!()
         },
         Schema::Enum(EnumSchema { name, ..}) => {
