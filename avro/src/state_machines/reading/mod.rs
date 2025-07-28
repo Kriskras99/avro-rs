@@ -13,12 +13,15 @@ use crate::{
     },
     types::Value,
 };
+use crate::schema::{ArraySchema, DecimalSchema, FixedSchema};
+
 pub mod async_impl;
 pub mod block;
 pub mod bytes;
 pub mod object;
 mod object_container_file;
 pub mod sync;
+mod commands;
 
 pub trait StateMachine: Sized {
     type Output: Sized;
@@ -68,8 +71,6 @@ pub enum SubStateMachine {
 /// A item that was read from the document.
 #[must_use]
 pub enum ItemRead {
-    // TODO: This is probably not useful to have
-    Null,
     Boolean(bool),
     Int(i32),
     Long(i64),
@@ -87,185 +88,6 @@ pub enum ItemRead {
     Union(u32),
     /// The start of a block of a Map or Array.
     Block(usize),
-}
-
-/// The next item type that should be read.
-#[must_use]
-pub enum ToRead {
-    Null,
-    Boolean,
-    Int,
-    Long,
-    Float,
-    Double,
-    Bytes,
-    String,
-    Enum,
-    Fixed(usize),
-    Array(CommandTape),
-    Map(CommandTape),
-    Union(Box<[CommandTape]>),
-}
-
-/// A section of a tape of commands.
-///
-/// This has a reference to the entire tape, so that references to types (for Union,Map,Array) can be resolved.
-#[derive(Debug, Clone)]
-#[must_use]
-pub struct CommandTape {
-    inner: Arc<[u8]>,
-    read_range: RangeInclusive<usize>,
-}
-
-impl CommandTape {
-    pub const NULL: u8 = 0;
-    pub const BOOLEAN: u8 = 1;
-    pub const INT: u8 = 2;
-    pub const LONG: u8 = 3;
-    pub const FLOAT: u8 = 4;
-    pub const DOUBLE: u8 = 5;
-    pub const BYTES: u8 = 6;
-    pub const STRING: u8 = 7;
-    pub const ENUM: u8 = 8;
-    pub const FIXED: u8 = 9;
-    // TODO: Maybe combine Array and Map into Block
-    // TODO: Add a type reference type, so that if a Block has a single type no reference is needed
-    pub const ARRAY: u8 = 10;
-    pub const MAP: u8 = 11;
-    pub const UNION: u8 = 12;
-
-    /// Create a new tape that will be read from start to end.
-    pub fn new(command_tape: Arc<[u8]>) -> Self {
-        let length = command_tape.len();
-        Self {
-            inner: command_tape,
-            read_range: 0..=length,
-        }
-    }
-
-    /// Check if the section of the tape we're reading is finished.
-    pub fn is_finished(&self) -> bool {
-        self.read_range.is_empty()
-    }
-
-    /// Extract a part from the tape to give to a sub state machine.
-    ///
-    /// The tape will run from start to end (inclusive).
-    pub fn extract(&self, start: usize, end: usize) -> Self {
-        assert!(
-            end < self.inner.len(),
-            "Reference is (partly) outside the tape"
-        );
-        Self {
-            inner: self.inner.clone(),
-            read_range: start..=end,
-        }
-    }
-
-    /// Extract many parts from the tape to give to the Union state machine.
-    ///
-    /// The tapes will run from start to end (inclusive).
-    pub fn extract_many(&self, parts: &[(usize, usize)]) -> Box<[Self]> {
-        let mut vec = Vec::with_capacity(parts.len());
-        for &(start, end) in parts {
-            vec.push(self.extract(start, end));
-        }
-        vec.into_boxed_slice()
-    }
-
-    /// Read an array of bytes from the tape.
-    fn read_array<const N: usize>(&mut self) -> [u8; N] {
-        let start = self.read_range.next().expect("Read past the limit");
-        let end = self.read_range.nth(N - 1).expect("Read past the limit");
-        self.inner[start..=end].try_into().expect("Unreachable!")
-    }
-
-    /// Get the next command from the tape.
-    ///
-    /// # Panics
-    /// Will panic if the commands are already finished, see [`Self::is_finished`].
-    pub fn command(&mut self) -> ToRead {
-        let position = self
-            .read_range
-            .next()
-            .expect("The caller read past the tape");
-        let byte = self.inner[position];
-        match byte & 0xF {
-            Self::NULL => ToRead::Null,
-            Self::BOOLEAN => ToRead::Boolean,
-            Self::INT => ToRead::Int,
-            Self::LONG => ToRead::Long,
-            Self::FLOAT => ToRead::Float,
-            Self::DOUBLE => ToRead::Double,
-            Self::BYTES => ToRead::Bytes,
-            Self::STRING => ToRead::String,
-            Self::ENUM => ToRead::Enum,
-            Self::FIXED => {
-                // ToRead::Fixed
-                if byte >> 4 != 0 {
-                    // Length is stored inine
-                    ToRead::Fixed((byte >> 4) as usize)
-                } else {
-                    let length = usize::from_ne_bytes(self.read_array());
-                    ToRead::Fixed(length)
-                }
-            }
-            Self::ARRAY => {
-                // ToRead::Array
-                // TODO: If the length of the type is less than 16 we can store the length inline
-                // TODO: Change end to length
-                // TODO: Use varint for start and length
-                let start = usize::from_ne_bytes(self.read_array());
-                let end = usize::from_ne_bytes(self.read_array());
-                ToRead::Array(self.extract(start, end))
-            }
-            Self::MAP => {
-                // ToRead::Map
-                // TODO: If the length of the type is less than 16 we can store the length inline
-                // TODO: Change end to length
-                // TODO: Use varint for start and length
-                let start = usize::from_ne_bytes(self.read_array());
-                let end = usize::from_ne_bytes(self.read_array());
-                ToRead::Map(self.extract(start, end))
-            }
-            Self::UNION => {
-                // ToRead::Union
-                // How many variants are there?
-                let number_of_options = if byte >> 4 != 0 {
-                    (byte >> 4) as usize
-                } else {
-                    // TODO: Use varint
-                    let number_of_options = u32::from_ne_bytes(self.read_array());
-                    number_of_options as usize
-                };
-
-                // Where are the references to the variants? Every reference is a pair of usizes.
-                // TODO: Use varint
-                let position_of_options = usize::from_ne_bytes(self.read_array());
-
-                // Assert that the references are inside the tape.
-                assert!(
-                    position_of_options + number_of_options * size_of::<(usize, usize)>()
-                        < self.inner.len(),
-                    "Options are (partly) outside the tape"
-                );
-                // TODO: Change options from start-end to start-length
-                // TODO: Use varint for start and length
-                // TODO: Find a safe way to do this
-                // SAFETY: As asserted above, the references are entirely inside the slice. The ptr is not null as we've
-                //         just read from the slice. We check that the options are aligned before creating the new slice.
-                //         The lifetime of the slice is set to the same lifetime as the parent slice.
-                let options = unsafe {
-                    let options: *const (usize, usize) =
-                        self.inner.as_ptr().add(position_of_options).cast();
-                    assert!(options.is_aligned());
-                    std::slice::from_raw_parts(options, number_of_options)
-                };
-                ToRead::Union(self.extract_many(options))
-            }
-            _ => unreachable!(), // TODO: There is room here to specialize certain types, like a Union of Null and some other type
-        }
-    }
 }
 
 /// Read a zigzagged varint from the buffer.
@@ -329,10 +151,5 @@ pub fn deserialize_from_tape<'a, T: Deserialize<'a>>(
     _schema: &Schema,
 ) -> Result<T, Error> {
     tape.clear();
-    todo!()
-}
-
-/// Convert a schema to a tape that can be used by the state machines.
-pub fn schema_to_command_tape(_schema: &Schema) -> CommandTape {
     todo!()
 }

@@ -29,11 +29,14 @@ categories.workspace = true
 documentation.workspace = true
 
 [features]
+default = ["futures", "sync"]
 bzip = ["dep:bzip2"]
 derive = ["dep:apache-avro-derive"]
 snappy = ["dep:crc32fast", "dep:snap"]
 xz = ["dep:xz2"]
 zstandard = ["dep:zstd"]
+futures = []
+sync = []
 
 [lib]
 # disable benchmarks to allow passing criterion arguments to `cargo bench`
@@ -77,6 +80,7 @@ winnow = { version = "0.7.12", features = ["simd"] }
 oval = { version = "2.0.0", features = ["bytes"] }
 futures = "0.3.31"
 async-stream = "0.3.6"
+synca = "0.5.3"
 
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

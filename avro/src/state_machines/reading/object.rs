@@ -45,7 +45,6 @@ impl StateMachine for ObjectStateMachine {
             match std::mem::take(self.current_sub_machine.deref_mut()) {
                 SubStateMachine::None => {
                     match self.command_tape.command() {
-                        ToRead::Null => self.tape.push(ItemRead::Null),
                         ToRead::Boolean => {
                             let mut byte = [0; 1];
                             buffer
