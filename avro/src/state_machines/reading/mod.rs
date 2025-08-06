@@ -6,22 +6,23 @@ use serde::Deserialize;
 use crate::{
     Error, Schema,
     error::Details,
+    schema::{ArraySchema, DecimalSchema, FixedSchema},
     state_machines::reading::{
         block::{ArrayStateMachine, MapStateMachine},
         bytes::BytesStateMachine,
+        commands::CommandTape,
         object::ObjectStateMachine,
     },
     types::Value,
 };
-use crate::schema::{ArraySchema, DecimalSchema, FixedSchema};
 
 pub mod async_impl;
 pub mod block;
 pub mod bytes;
+mod commands;
 pub mod object;
 mod object_container_file;
 pub mod sync;
-mod commands;
 
 pub trait StateMachine: Sized {
     type Output: Sized;

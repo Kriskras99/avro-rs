@@ -2,17 +2,17 @@ use std::{io::Read, ops::DerefMut as _};
 
 use oval::Buffer;
 
+use super::StateMachineResult;
 use crate::{
     error::Details,
     state_machines::reading::{
-        CommandTape, ItemRead, StateMachine, StateMachineControlFlow, SubStateMachine, ToRead,
+        CommandTape, ItemRead, StateMachine, StateMachineControlFlow, SubStateMachine,
         block::{ArrayStateMachine, MapStateMachine},
         bytes::BytesStateMachine,
+        commands::ToRead,
         decode_zigzag, replace_drop,
     },
 };
-
-use super::StateMachineResult;
 
 pub struct ObjectStateMachine {
     command_tape: CommandTape,
@@ -44,7 +44,10 @@ impl StateMachine for ObjectStateMachine {
             // Only continue reading the tape if we're not currently driving a sub state machine.
             match std::mem::take(self.current_sub_machine.deref_mut()) {
                 SubStateMachine::None => {
-                    match self.command_tape.command() {
+                    let Some(command) = self.command_tape.command() else {
+                        break;
+                    };
+                    match command {
                         ToRead::Boolean => {
                             let mut byte = [0; 1];
                             buffer
@@ -164,42 +167,43 @@ impl StateMachine for ObjectStateMachine {
                                 }
                             }
                         }
-                        ToRead::Array(command_tape) => {
-                            let fsm = ArrayStateMachine::new(
-                                command_tape,
-                                std::mem::take(&mut self.tape),
-                            );
-                            // Optimistically run the state machine
-                            match fsm.parse(buffer)? {
-                                StateMachineControlFlow::NeedMore(fsm) => {
-                                    replace_drop(
-                                        self.current_sub_machine.deref_mut(),
-                                        SubStateMachine::Array(fsm),
-                                    );
-                                    return Ok(StateMachineControlFlow::NeedMore(self));
-                                }
-                                StateMachineControlFlow::Done(tape) => {
-                                    self.tape = tape;
-                                }
-                            }
-                        }
-                        ToRead::Map(command_tape) => {
-                            let fsm =
-                                MapStateMachine::new(command_tape, std::mem::take(&mut self.tape));
-                            // Optimistically run the state machine
-                            match fsm.parse(buffer)? {
-                                StateMachineControlFlow::NeedMore(fsm) => {
-                                    replace_drop(
-                                        self.current_sub_machine.deref_mut(),
-                                        SubStateMachine::Map(fsm),
-                                    );
-                                    return Ok(StateMachineControlFlow::NeedMore(self));
-                                }
-                                StateMachineControlFlow::Done(tape) => {
-                                    self.tape = tape;
-                                }
-                            }
-                        }
+                        ToRead::Block(_command_tape) => todo!(),
+                        // ToRead::Array(command_tape) => {
+                        //     let fsm = ArrayStateMachine::new(
+                        //         command_tape,
+                        //         std::mem::take(&mut self.tape),
+                        //     );
+                        //     // Optimistically run the state machine
+                        //     match fsm.parse(buffer)? {
+                        //         StateMachineControlFlow::NeedMore(fsm) => {
+                        //             replace_drop(
+                        //                 self.current_sub_machine.deref_mut(),
+                        //                 SubStateMachine::Array(fsm),
+                        //             );
+                        //             return Ok(StateMachineControlFlow::NeedMore(self));
+                        //         }
+                        //         StateMachineControlFlow::Done(tape) => {
+                        //             self.tape = tape;
+                        //         }
+                        //     }
+                        // }
+                        // ToRead::Map(command_tape) => {
+                        //     let fsm =
+                        //         MapStateMachine::new(command_tape, std::mem::take(&mut self.tape));
+                        //     // Optimistically run the state machine
+                        //     match fsm.parse(buffer)? {
+                        //         StateMachineControlFlow::NeedMore(fsm) => {
+                        //             replace_drop(
+                        //                 self.current_sub_machine.deref_mut(),
+                        //                 SubStateMachine::Map(fsm),
+                        //             );
+                        //             return Ok(StateMachineControlFlow::NeedMore(self));
+                        //         }
+                        //         StateMachineControlFlow::Done(tape) => {
+                        //             self.tape = tape;
+                        //         }
+                        //     }
+                        // }
                         ToRead::Union(variants) => {
                             // Optimistically try to get the variant
                             let Some(index) = decode_zigzag(buffer)? else {

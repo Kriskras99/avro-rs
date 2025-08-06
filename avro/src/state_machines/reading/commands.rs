@@ -1,13 +1,17 @@
-use std::collections::HashMap;
-use std::ops::{Range, RangeInclusive};
-use std::sync::Arc;
-use crate::error::Details;
-use crate::{Error, Schema};
-use crate::schema::{ArraySchema, DecimalSchema, EnumSchema, FixedSchema, MapSchema, Name, RecordSchema, UnionSchema};
+use crate::{
+    Error, Schema,
+    error::Details,
+    schema::{
+        ArraySchema, DecimalSchema, EnumSchema, FixedSchema, MapSchema, Name, RecordSchema,
+        UnionSchema,
+    },
+};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
 /// The next item type that should be read.
 #[must_use]
 pub enum ToRead {
+    Null,
     Boolean,
     Int,
     Long,
@@ -18,9 +22,29 @@ pub enum ToRead {
     Enum,
     Ref(CommandTape),
     Fixed(usize),
-    Array(CommandTape),
-    Map(CommandTape),
-    Union(Box<[CommandTape]>),
+    Block(CommandTape),
+    Union(UnionVariants),
+}
+
+pub struct UnionVariants {
+    tape: CommandTape,
+    num_variants: usize,
+}
+
+impl UnionVariants {
+    pub fn get(mut self, index: usize) -> Result<ToRead, Error> {
+        if index >= self.num_variants {
+            return Err(Details::GetUnionVariant {
+                index: index as i64,
+                num_variants: self.num_variants,
+            }
+            .into());
+        }
+        // Skip past the other variants
+        self.tape.skip(index);
+        // Get the command for the variant
+        Ok(self.tape.command().expect("Unreachable!"))
+    }
 }
 
 /// A section of a tape of commands.
@@ -34,13 +58,7 @@ pub struct CommandTape {
 }
 
 impl CommandTape {
-    /// A reference to a command sequence somewhere else in the tape.
-    ///
-    /// If the length of the sequence is smaller than or equal to `0xF`, the length is stored in the
-    /// four most significant bits of the byte. Otherwise, it's stored as a native endian usize
-    /// directly after the command byte. After the length follows the offset as a native endian
-    /// usize.
-    pub const REF: u8 = 0;
+    pub const NULL: u8 = 0;
     pub const BOOLEAN: u8 = 1;
     pub const INT: u8 = 2;
     pub const LONG: u8 = 3;
@@ -63,12 +81,21 @@ impl CommandTape {
     /// put behind a [`Self::REF`].
     pub const BLOCK: u8 = 10;
     pub const UNION: u8 = 11;
+    /// A reference to a command sequence somewhere else in the tape.
+    ///
+    /// If the length of the sequence is smaller than or equal to `0xF`, the length is stored in the
+    /// four most significant bits of the byte. Otherwise, it's stored as a native endian usize
+    /// directly after the command byte. After the length follows the offset as a native endian
+    /// usize.
+    pub const REF: u8 = 12;
     /// Skip the next `n` commands.
+    ///
+    /// A SKIP command is not counted as a command.
     ///
     /// If `n` is smaller than or equal to `0xF`, the amount is stored in the four most significant
     /// bits of the byte. Otherwise, it's stored as a native endian usize directly after the command
     /// byte.
-    pub const SKIP: u8 = 12;
+    pub const SKIP: u8 = 13;
 
     /// Create a new tape that will be read from start to end.
     pub fn new(command_tape: Arc<[u8]>) -> Self {
@@ -80,11 +107,7 @@ impl CommandTape {
     }
 
     pub fn build_from_schema(schema: &Schema) -> Result<Self, Error> {
-        let mut references = HashMap::new();
-        let mut tape = Vec::new();
-        add_schema_to_tape(&mut tape, schema, &mut references)?;
-        let length = tape.len();
-        Ok(Self { inner: Arc::from(tape), read_range: 0..length })
+        CommandTapeBuilder::build(schema)
     }
 
     /// Check if the section of the tape we're reading is finished.
@@ -92,10 +115,17 @@ impl CommandTape {
         self.read_range.is_empty()
     }
 
-    /// Extract a part from the tape to give to a sub state machine.
+    /// Extract a part from the tape to give to a sub-state machine.
     ///
-    /// The tape will run from start to end (inclusive).
-    pub fn extract(&self, offset: usize, size: usize) -> Self {
+    /// The tape will run from offset for the given amount of commands.
+    pub fn extract(&self, offset: usize, commands: usize) -> Self {
+        let mut temp = Self {
+            inner: self.inner.clone(),
+            read_range: offset..self.inner.len(),
+        };
+        temp.skip(commands);
+        let size = temp.read_range.next().unwrap_or(self.inner.len());
+
         assert!(
             offset + size <= self.inner.len(),
             "Reference is (partly) outside the tape"
@@ -126,301 +156,441 @@ impl CommandTape {
 
     /// Get the next command from the tape.
     ///
-    /// # Panics
-    /// Will panic if the commands are already finished, see [`Self::is_finished`].
-    pub fn command(&mut self) -> ToRead {
-        let position = self
-            .read_range
-            .next()
-            .expect("The caller read past the tape");
-        let byte = self.inner[position];
-        match byte & 0xF {
-            Self::REF => {
-                // ToRead::Ref
-                let size = if byte >> 4 != 0 {
-                    // Length is stored inline
-                    (byte >> 4) as usize
-                } else {
-                    usize::from_ne_bytes(self.read_array())
-                };
-                let offset = usize::from_ne_bytes(self.read_array());
-                ToRead::Ref(self.extract(offset, size))
-            }
-            Self::BOOLEAN => ToRead::Boolean,
-            Self::INT => ToRead::Int,
-            Self::LONG => ToRead::Long,
-            Self::FLOAT => ToRead::Float,
-            Self::DOUBLE => ToRead::Double,
-            Self::BYTES => ToRead::Bytes,
-            Self::STRING => ToRead::String,
-            Self::ENUM => ToRead::Enum,
-            Self::FIXED => {
-                // ToRead::Fixed
-                if byte >> 4 != 0 {
-                    // Length is stored inline
-                    ToRead::Fixed((byte >> 4) as usize)
-                } else {
-                    let length = usize::from_ne_bytes(self.read_array());
-                    ToRead::Fixed(length)
+    /// Will return `None` if exhausted.
+    pub fn command(&mut self) -> Option<ToRead> {
+        if let Some(position) = self.read_range.next() {
+            let byte = self.inner[position];
+            match byte & 0xF {
+                Self::NULL => Some(ToRead::Null),
+                Self::BOOLEAN => Some(ToRead::Boolean),
+                Self::INT => Some(ToRead::Int),
+                Self::LONG => Some(ToRead::Long),
+                Self::FLOAT => Some(ToRead::Float),
+                Self::DOUBLE => Some(ToRead::Double),
+                Self::BYTES => Some(ToRead::Bytes),
+                Self::STRING => Some(ToRead::String),
+                Self::ENUM => Some(ToRead::Enum),
+                Self::FIXED => {
+                    // ToRead::Fixed
+                    if byte >> 4 != 0 {
+                        // Length is stored inline
+                        Some(ToRead::Fixed((byte >> 4) as usize))
+                    } else {
+                        let length = usize::from_ne_bytes(self.read_array());
+                        Some(ToRead::Fixed(length))
+                    }
                 }
-            }
-            Self::ARRAY => {
-                // ToRead::Array
-                // TODO: Use varint for start and length
-                let size = if byte >> 4 != 0 {
-                    // Length is stored inline
-                    (byte >> 4) as usize
-                } else {
-                    usize::from_ne_bytes(self.read_array())
-                };
-                let offset = usize::from_ne_bytes(self.read_array());
-                ToRead::Array(self.extract(offset, size))
-            }
-            Self::MAP => {
-                // ToRead::Map
-                // TODO: If the length of the type is less than 16 we can store the length inline
-                let size = if byte >> 4 != 0 {
-                    // Length is stored inline
-                    (byte >> 4) as usize
-                } else {
-                    usize::from_ne_bytes(self.read_array())
-                };
-                let offset = usize::from_ne_bytes(self.read_array());
-                ToRead::Map(self.extract(offset, size))
-            }
-            Self::UNION => {
-                // ToRead::Union
-                // How many variants are there?
-                let number_of_options = if byte >> 4 != 0 {
-                    (byte >> 4) as usize
-                } else {
-                    // TODO: Use varint
-                    let number_of_options = u32::from_ne_bytes(self.read_array());
-                    number_of_options as usize
-                };
+                Self::BLOCK => {
+                    // ToRead::Block
+                    let size = (byte >> 4) as usize;
+                    self.skip(size);
+                    Some(ToRead::Block(self.extract(position + 1, size)))
+                }
+                Self::UNION => {
+                    // ToRead::Union
+                    // How many variants are there?
+                    let num_variants = if byte >> 4 != 0 {
+                        (byte >> 4) as usize
+                    } else {
+                        // TODO: Use varint
+                        let num_variants = u32::from_ne_bytes(self.read_array());
+                        num_variants as usize
+                    };
+                    let variants = UnionVariants {
+                        tape: self.clone(),
+                        num_variants,
+                    };
 
-                // Where are the references to the variants? Every reference is a pair of usizes.
-                // TODO: Use varint
-                let position_of_options = usize::from_ne_bytes(self.read_array());
+                    // Skip over the commands for the variants
+                    self.skip(num_variants);
 
-                // Assert that the references are inside the tape.
-                assert!(
-                    position_of_options + number_of_options * size_of::<(usize, usize)>()
-                        < self.inner.len(),
-                    "Options are (partly) outside the tape"
-                );
-                // TODO: Use varint for start and length
-                // TODO: Find a safe way to do this
-                // SAFETY: As asserted above, the references are entirely inside the slice. The ptr is not null as we've
-                //         just read from the slice. We check that the options are aligned before creating the new slice.
-                //         The lifetime of the slice is set to the same lifetime as the parent slice.
-                let options = unsafe {
-                    let options: *const (usize, usize) =
-                        self.inner.as_ptr().add(position_of_options).cast();
-                    assert!(options.is_aligned());
-                    std::slice::from_raw_parts(options, number_of_options)
-                };
-                ToRead::Union(self.extract_many(options))
+                    Some(ToRead::Union(variants))
+                }
+                Self::REF => {
+                    // ToRead::Ref
+                    let size = if byte >> 4 != 0 {
+                        // Length is stored inline
+                        (byte >> 4) as usize
+                    } else {
+                        usize::from_ne_bytes(self.read_array())
+                    };
+                    let offset = usize::from_ne_bytes(self.read_array());
+                    Some(ToRead::Ref(self.extract(offset, size)))
+                }
+                Self::SKIP => {
+                    let commands = if byte >> 4 != 0 {
+                        (byte >> 4) as usize
+                    } else {
+                        usize::from_ne_bytes(self.read_array())
+                    };
+                    self.skip(commands);
+
+                    self.command()
+                }
+                _ => unreachable!(), // TODO: There is room here to specialize certain types, like a Union of Null and some other type
             }
-            _ => unreachable!(), // TODO: There is room here to specialize certain types, like a Union of Null and some other type
+        } else {
+            None
+        }
+    }
+
+    /// Skip `amount` commands.
+    ///
+    /// If a command contains subcommands, these will also be skipped.
+    fn skip(&mut self, mut amount: usize) {
+        let mut i = 0;
+        while i < amount {
+            let position = self
+                .read_range
+                .next()
+                .expect("The caller read past the tape");
+            let byte = self.inner[position];
+            match byte & 0xF {
+                CommandTape::REF => {
+                    if byte >> 4 == 0 {
+                        let _size = usize::from_ne_bytes(self.read_array());
+                    }
+                    let _offset = usize::from_ne_bytes(self.read_array());
+                }
+                CommandTape::BOOLEAN
+                | CommandTape::INT
+                | CommandTape::LONG
+                | CommandTape::FLOAT
+                | CommandTape::DOUBLE
+                | CommandTape::BYTES
+                | CommandTape::STRING
+                | CommandTape::ENUM
+                | CommandTape::NULL => {}
+                CommandTape::FIXED => {
+                    if byte >> 4 == 0 {
+                        let _size = usize::from_ne_bytes(self.read_array());
+                    }
+                }
+                CommandTape::UNION | CommandTape::BLOCK | CommandTape::SKIP => {
+                    // These commands can inline other commands, so add them to the skip list
+                    let num_variants = if byte >> 4 != 0 {
+                        (byte >> 4) as usize
+                    } else {
+                        // TODO: Use varint
+                        let num_variants = u32::from_ne_bytes(self.read_array());
+                        num_variants as usize
+                    };
+                    amount += num_variants;
+                }
+                _ => unreachable!(),
+            }
+            i += 1;
         }
     }
 }
 
-fn add_schema_to_tape(tape: &mut Vec<u8>, schema: &Schema, references: &mut HashMap<Name, (usize, usize)>) -> Result<(), Error> {
-    match schema {
-        Schema::Null => { },
-        Schema::Boolean => tape.push(CommandTape::BOOLEAN),
-        Schema::Int => tape.push(CommandTape::INT),
-        Schema::Long => tape.push(CommandTape::LONG),
-        Schema::Float => tape.push(CommandTape::FLOAT),
-        Schema::Double => tape.push(CommandTape::DOUBLE),
-        Schema::Bytes => tape.push(CommandTape::BYTES),
-        Schema::String => tape.push(CommandTape::STRING),
-        Schema::Array(ArraySchema { items, .. }) => {
-            if let Some(name) = items.name() && let Some((offset, len)) = references.get(&name).copied() {
-                // The item schema was already serialized before
-                if len == 0 {
-                    // An array of nulls?
-                    tape.push(CommandTape::BLOCK);
-                } else if len <= 0xF {
-                    // Inline the value as it's small
-                    tape.push(CommandTape::BLOCK | ((len as u8) << 4));
-                    tape.extend_from_within(offset..(offset + len));
-                } else {
-                    // Too large to inline, insert a REF
-                    tape.push(CommandTape::BLOCK | 1 << 4);
-                    tape.push(CommandTape::REF);
-                    tape.extend_from_slice(&len.to_ne_bytes());
-                    tape.extend_from_slice(&offset.to_ne_bytes());
-                }
-            } else {
-                // The item schema has not been serialized yet, or is not a named schema
-                // As the schema might be arbitrarily large, we insert a SKIP with room for a length
-                // we can remove it if it turns out not to be necessary
-                let before = tape.len();
-                tape.push(CommandTape::SKIP);
-                tape.extend_from_slice(&0usize.to_ne_bytes());
-                // Make sure we know the offset of the schema
-                let schema_offset = tape.len();
-                // Serialize the schema to the tape
-                add_schema_to_tape(tape, schema, references)?;
-                // Calculate the size of the schema
-                let schema_len = tape.len() - schema_offset;
-                if schema_len {
-                    // An array of nulls?
-                    tape.truncate(before);
-                    tape.push(CommandTape::BLOCK);
-                } else if schema_len <= 0xF {
-                    // Small enough to inline, replace the SKIP with the BLOCK and remove the 8 length
-                    // bytes after SKIP
-                    tape[before] = CommandTape::BLOCK | ((schema_len as u8) << 4);
-                    tape.copy_within(before + 8..tape.len(), before + 1);
-                    // Update the reference if it was added
-                    if let Some(name) = items.name() {
-                        references.get_mut(&name).expect("Name exists").0 = before + 1;
-                    }
-                } else {
-                    // Too large to inline, update the SKIP with the correct len
-                    tape[before + 1..before + 9].copy_from_slice(&schema_len.to_ne_bytes());
-                    // Add the BLOCK and REF
-                    tape.push(CommandTape::BLOCK | 1 << 4);
-                    tape.push(CommandTape::REF);
-                    tape.copy_from_slice(&schema_len.to_ne_bytes());
-                    tape.copy_from_slice(&schema_offset.to_ne_bytes());
-                }
-            }
-        },
-        Schema::Map(MapSchema { types, ..}) => {
-            if let Some(name) = types.name() && let Some((offset, len)) = references.get(&name).copied() {
-                // The type schema was already serialized before
-                if len == 0 {
-                    // A map of nulls, so a set?
-                    tape.push(CommandTape::BLOCK | 1 << 4);
-                    tape.push(CommandTape::STRING);
-                } else if len < 0xF {
-                    // Inline the value as it's small
-                    tape.push(CommandTape::BLOCK | (((len + 1) as u8) << 4));
-                    tape.push(CommandTape::STRING);
-                    tape.extend_from_within(offset..(offset + len));
-                } else {
-                    // Too large to inline, insert a REF
-                    tape.push(CommandTape::BLOCK | 2 << 4);
-                    tape.push(CommandTape::STRING);
-                    // Without the STRING the size might fit inline in the REF
-                    if len <= 0xF {
-                        tape.push(CommandTape::REF | (len as u8) << 4);
-                    } else {
-                        tape.extend_from_slice(&len.to_ne_bytes());
-                    }
-                    tape.extend_from_slice(&offset.to_ne_bytes());
-                }
-            } else {
-                // The types schema has not been serialized yet, or is not a named schema
-                // As the schema might be arbitrarily large, we insert a SKIP with room for a length
-                // we can remove it if it turns out not to be necessary
-                let before = tape.len();
-                tape.push(CommandTape::SKIP);
-                tape.extend_from_slice(&0usize.to_ne_bytes());
-                // Make sure we know the offset of the schema
-                let schema_offset = tape.len();
-                // Serialize the schema to the tape
-                add_schema_to_tape(tape, schema, references)?;
-                // Calculate the size of the schema
-                let schema_len = tape.len() - schema_offset;
-                if schema_len {
-                    // A map of nulls, so a set?
-                    tape.truncate(before);
-                    tape.push(CommandTape::BLOCK | (1 << 4));
-                    tape.push(CommandTape::STRING);
-                } else if schema_len < 0xF {
-                    // Small enough to inline, replace the SKIP with the BLOCK and remove the 8 length
-                    // bytes after SKIP
-                    tape[before] = CommandTape::BLOCK | ((schema_len + 1 as u8) << 4);
-                    tape[before + 1] = CommandTape::STRING;
-                    tape.copy_within(before + 8..tape.len(), before + 2);
-                    // Update the reference if it was added
-                    if let Some(name) = types.name() {
-                        references.get_mut(&name).expect("Name exists").0 = before + 2;
-                    }
-                } else {
-                    // Too large to inline, update the SKIP with the correct len
-                    tape[before + 1..before + 9].copy_from_slice(&schema_len.to_ne_bytes());
-                    // Add the BLOCK and REF
-                    tape.push(CommandTape::BLOCK | 2 << 4);
-                    tape.push(CommandTape::STRING);
-                    // Without the STRING the size might fit inline in the REF
-                    if schema_len <= 0xF {
-                        tape.push(CommandTape::REF | ((schema_len as u8) << 4));
-                    } else {
-                        tape.push(CommandTape::REF);
-                        tape.copy_from_slice(&schema_len.to_ne_bytes());
-                    }
-                    tape.copy_from_slice(&schema_offset.to_ne_bytes());
-                }
-            }
-        },
-        Schema::Union(UnionSchema { schemas, ..}) => {
-            let variants = schemas.len();
-            let mut schema_refs = Vec::with_capacity(variants);
-            for schema in schemas {
-                if let Some(name) = schema.name() && let Some(reference) = references.get(name).copied() {
-                    schema_refs.push(reference);
-                } else {
-                    todo!();
-                }
-            }
-            todo!()
-        },
-        Schema::Record(RecordSchema { fields, name, ..}) => {
-            todo!()
-        },
-        Schema::Enum(EnumSchema { name, ..}) => {
-            let index = tape.len();
-            tape.push(CommandTape::ENUM);
-            references.insert(name.clone(), (index, 1));
-        },
-        Schema::Fixed(FixedSchema { size, name, .. }) => {
-            let size = *size;
-            if 0 < size && size <= 0xF {
-                let index = tape.len();
-                tape.push(CommandTape::FIXED | ((size as u8) << 4));
-                references.insert(name.clone(), (index, 1));
-            } else {
-                let index = tape.len();
-                tape.push(CommandTape::FIXED);
-                tape.extend_from_slice(&size.to_ne_bytes());
-                references.insert(name.clone(), (index, 1 + size_of_val(&size)));
-            }
-        }
-        Schema::Decimal(DecimalSchema { inner, ..}) => add_schema_to_tape(tape, &inner, references)?,
-        Schema::BigDecimal => tape.push(CommandTape::BYTES),
-        Schema::Uuid => tape.push(CommandTape::STRING),
-        Schema::Date => tape.push(CommandTape::INT),
-        Schema::TimeMillis => tape.push(CommandTape::INT),
-        Schema::TimeMicros => tape.push(CommandTape::LONG),
-        Schema::TimestampMillis => tape.push(CommandTape::LONG),
-        Schema::TimestampMicros => tape.push(CommandTape::LONG),
-        Schema::TimestampNanos => tape.push(CommandTape::LONG),
-        Schema::LocalTimestampMillis => tape.push(CommandTape::LONG),
-        Schema::LocalTimestampMicros => tape.push(CommandTape::LONG),
-        Schema::LocalTimestampNanos => tape.push(CommandTape::LONG),
-        Schema::Duration => tape.push(CommandTape::FIXED | 12 << 4),
-        Schema::Ref { name } => {
-            let Some((start, len)) = references.get(&name).copied() else {
-                return Err(Details::SchemaResolutionError(name.clone()).into());
-            };
-            if len == 0 {
-                // Referenced schema only has nulls?
-                return Ok(());
-            }
-            if len <= 0xF {
-                tape.push(CommandTape::REF | (len as u8) << 4)
-            } else {
-                tape.extend_from_slice(&len.to_ne_bytes());
-            }
-            tape.extend_from_slice(&start.to_ne_bytes());
+struct CommandTapeBuilder<'a> {
+    tape: Vec<u8>,
+    references: HashMap<&'a Name, (usize, usize)>,
+}
+
+impl<'a> CommandTapeBuilder<'a> {
+    pub fn new() -> Self {
+        Self {
+            tape: Vec::new(),
+            references: HashMap::new(),
         }
     }
-    Ok(())
+
+    fn add_schema(&mut self, schema: &'a Schema, inline_up_to: usize) -> Result<usize, Error> {
+        match schema {
+            Schema::Null => {
+                self.tape.push(CommandTape::NULL);
+                Ok(1)
+            }
+            Schema::Boolean => {
+                self.tape.push(CommandTape::BOOLEAN);
+                Ok(1)
+            }
+            Schema::Int | Schema::Date | Schema::TimeMillis => {
+                self.tape.push(CommandTape::INT);
+                Ok(1)
+            }
+            Schema::Long
+            | Schema::TimeMicros
+            | Schema::TimestampMillis
+            | Schema::TimestampMicros
+            | Schema::TimestampNanos
+            | Schema::LocalTimestampMillis
+            | Schema::LocalTimestampMicros
+            | Schema::LocalTimestampNanos => {
+                self.tape.push(CommandTape::LONG);
+                Ok(1)
+            }
+            Schema::Float => {
+                self.tape.push(CommandTape::FLOAT);
+                Ok(1)
+            }
+            Schema::Double => {
+                self.tape.push(CommandTape::DOUBLE);
+                Ok(1)
+            }
+            Schema::Bytes | Schema::BigDecimal => {
+                self.tape.push(CommandTape::BYTES);
+                Ok(1)
+            }
+            Schema::String | Schema::Uuid => {
+                self.tape.push(CommandTape::STRING);
+                Ok(1)
+            }
+            Schema::Array(ArraySchema { items, .. }) => {
+                let block_offset = self.tape.len();
+                self.tape.push(CommandTape::BLOCK);
+                let commands = self.add_schema(items, 16)?;
+                self.tape[block_offset] = CommandTape::BLOCK | (commands << 4) as u8;
+                Ok(1)
+            }
+            Schema::Map(MapSchema { types, .. }) => {
+                let block_offset = self.tape.len();
+                self.tape.push(CommandTape::BLOCK);
+                self.tape.push(CommandTape::STRING);
+                let commands = self.add_schema(types, 15)?;
+                self.tape[block_offset] = CommandTape::BLOCK | (commands + 1 << 4) as u8;
+                Ok(1)
+            }
+            Schema::Union(UnionSchema { schemas, .. }) => {
+                let schema_len = schemas.len();
+                if 0 < schema_len && schema_len <= 0xF {
+                    self.tape.push(CommandTape::UNION | (schema_len << 4) as u8);
+                } else {
+                    self.tape.push(CommandTape::UNION);
+                    self.tape.extend_from_slice(&schema_len.to_ne_bytes());
+                }
+                for schema in schemas {
+                    self.add_schema(schema, 1)?;
+                }
+                Ok(1)
+            }
+            Schema::Record(RecordSchema { name, fields, .. }) => {
+                if let Some(&(offset, commands)) = self.references.get(name) {
+                    self.add_reference(offset, commands);
+                    Ok(1)
+                } else if fields.len() == 0 {
+                    let offset = self.tape.len();
+                    self.tape.push(CommandTape::NULL);
+                    self.references.insert(name, (offset, 1));
+                    Ok(1)
+                } else {
+                    let commands = fields.len();
+                    if commands > inline_up_to {
+                        // If this record is larger than the amount we're allowed to inline, inject
+                        // a SKIP command.
+                        if commands <= 0xF {
+                            self.tape.push(CommandTape::SKIP | (commands << 4) as u8);
+                        } else {
+                            self.tape.push(CommandTape::SKIP);
+                            self.tape.extend_from_slice(&commands.to_ne_bytes());
+                        }
+                    }
+                    let offset = self.tape.len();
+                    self.references.insert(name, (offset, commands));
+                    for field in fields {
+                        let _commands = self.add_schema(&field.schema, 1)?;
+                    }
+                    if commands > inline_up_to {
+                        // Now refer back to the skip block
+                        self.add_reference(offset, commands);
+                        Ok(1)
+                    } else {
+                        Ok(commands)
+                    }
+                }
+            }
+            Schema::Enum(EnumSchema { name, .. }) => {
+                let offset = self.tape.len();
+                let commands = 1;
+                self.tape.push(CommandTape::ENUM);
+                self.references.insert(name, (offset, commands));
+                Ok(1)
+            }
+            Schema::Fixed(FixedSchema { name, size, .. }) => {
+                let offset = self.tape.len();
+                if 0 < *size && *size <= 0xF {
+                    self.tape.push(CommandTape::FIXED | (*size << 4) as u8);
+                } else {
+                    self.tape.push(CommandTape::FIXED);
+                    self.tape.extend_from_slice(&size.to_ne_bytes());
+                }
+                self.references.entry(name).or_insert((offset, 1));
+                Ok(1)
+            }
+            Schema::Decimal(DecimalSchema { inner, .. }) => self.add_schema(&inner, inline_up_to),
+            Schema::Duration => {
+                self.tape.push(CommandTape::FIXED | 12 << 4);
+                Ok(1)
+            }
+            Schema::Ref { name } => {
+                let &(offset, commands) = self
+                    .references
+                    .get(name)
+                    .ok_or_else(|| Details::SchemaResolutionError(name.clone()))?;
+                self.add_reference(offset, commands);
+                Ok(1)
+            }
+        }
+    }
+
+    fn add_reference(&mut self, offset: usize, commands: usize) {
+        if commands == 0 {
+            self.tape.push(CommandTape::NULL);
+        } else if commands <= 0xF {
+            self.tape.push(CommandTape::REF | (commands << 4) as u8);
+        } else {
+            self.tape.push(CommandTape::REF);
+            self.tape.extend_from_slice(&commands.to_ne_bytes());
+        }
+        self.tape.extend_from_slice(&offset.to_ne_bytes());
+    }
+
+    pub fn build(schema: &Schema) -> Result<CommandTape, Error> {
+        let mut builder = Self::new();
+
+        builder.add_schema(schema, usize::MAX)?;
+
+        let tape_len = builder.tape.len();
+        Ok(CommandTape {
+            inner: Arc::from(builder.tape),
+            read_range: 0..tape_len,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    pub fn command_tape_simple() {
+        assert_eq!(
+            CommandTape::build_from_schema(&Schema::Null)
+                .unwrap()
+                .inner
+                .as_ref(),
+            &[CommandTape::NULL]
+        );
+        assert_eq!(
+            CommandTape::build_from_schema(&Schema::Boolean)
+                .unwrap()
+                .inner
+                .as_ref(),
+            &[CommandTape::BOOLEAN]
+        );
+        assert_eq!(
+            CommandTape::build_from_schema(&Schema::Int)
+                .unwrap()
+                .inner
+                .as_ref(),
+            &[CommandTape::INT]
+        );
+        assert_eq!(
+            CommandTape::build_from_schema(&Schema::Date)
+                .unwrap()
+                .inner
+                .as_ref(),
+            &[CommandTape::INT]
+        );
+        assert_eq!(
+            CommandTape::build_from_schema(&Schema::TimeMillis)
+                .unwrap()
+                .inner
+                .as_ref(),
+            &[CommandTape::INT]
+        );
+        assert_eq!(
+            CommandTape::build_from_schema(&Schema::Long)
+                .unwrap()
+                .inner
+                .as_ref(),
+            &[CommandTape::LONG]
+        );
+        assert_eq!(
+            CommandTape::build_from_schema(&Schema::TimeMicros)
+                .unwrap()
+                .inner
+                .as_ref(),
+            &[CommandTape::LONG]
+        );
+        assert_eq!(
+            CommandTape::build_from_schema(&Schema::TimestampMillis)
+                .unwrap()
+                .inner
+                .as_ref(),
+            &[CommandTape::LONG]
+        );
+        assert_eq!(
+            CommandTape::build_from_schema(&Schema::TimestampMicros)
+                .unwrap()
+                .inner
+                .as_ref(),
+            &[CommandTape::LONG]
+        );
+        assert_eq!(
+            CommandTape::build_from_schema(&Schema::TimestampNanos)
+                .unwrap()
+                .inner
+                .as_ref(),
+            &[CommandTape::LONG]
+        );
+        assert_eq!(
+            CommandTape::build_from_schema(&Schema::LocalTimestampMillis)
+                .unwrap()
+                .inner
+                .as_ref(),
+            &[CommandTape::LONG]
+        );
+        assert_eq!(
+            CommandTape::build_from_schema(&Schema::LocalTimestampMicros)
+                .unwrap()
+                .inner
+                .as_ref(),
+            &[CommandTape::LONG]
+        );
+        assert_eq!(
+            CommandTape::build_from_schema(&Schema::LocalTimestampNanos)
+                .unwrap()
+                .inner
+                .as_ref(),
+            &[CommandTape::LONG]
+        );
+        assert_eq!(
+            CommandTape::build_from_schema(&Schema::Float)
+                .unwrap()
+                .inner
+                .as_ref(),
+            &[CommandTape::FLOAT]
+        );
+        assert_eq!(
+            CommandTape::build_from_schema(&Schema::Double)
+                .unwrap()
+                .inner
+                .as_ref(),
+            &[CommandTape::DOUBLE]
+        );
+        assert_eq!(
+            CommandTape::build_from_schema(&Schema::Bytes)
+                .unwrap()
+                .inner
+                .as_ref(),
+            &[CommandTape::BYTES]
+        );
+        assert_eq!(
+            CommandTape::build_from_schema(&Schema::String)
+                .unwrap()
+                .inner
+                .as_ref(),
+            &[CommandTape::STRING]
+        );
+        assert_eq!(
+            CommandTape::build_from_schema(&Schema::Uuid)
+                .unwrap()
+                .inner
+                .as_ref(),
+            &[CommandTape::STRING]
+        );
+    }
 }

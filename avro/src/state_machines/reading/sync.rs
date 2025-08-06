@@ -7,7 +7,9 @@ use crate::{
     Error, Schema,
     error::Details,
     state_machines::reading::{
-        ItemRead, StateMachine, StateMachineControlFlow, deserialize_from_tape,
+        ItemRead, StateMachine, StateMachineControlFlow,
+        commands::CommandTape,
+        deserialize_from_tape,
         object_container_file::{
             ObjectContainerFileBodyStateMachine, ObjectContainerFileHeader,
             ObjectContainerFileHeaderStateMachine,
@@ -50,7 +52,7 @@ impl<'a, R: Read> ObjectContainerFileReader<'a, R> {
             }
         };
 
-        let tape = schema_to_command_tape(&header.schema);
+        let tape = CommandTape::build_from_schema(&header.schema)?;
 
         Ok(Self {
             reader_schema: None,

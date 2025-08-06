@@ -26,12 +26,11 @@ use crate::{
 /// ```
 #[rustfmt::skip]
 const HEADER_TAPE: &[u8] = &[
-    CommandTape::MAP,                               // Starts with a map
-    0x1A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // The type description starts at 0x1A
-    0x1A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // The type description ends at 0x1A (inclusive)
+    CommandTape::BLOCK | 2 << 4,                    // Starts with a map
+    CommandTape::STRING,                            // The keys are strings
+    CommandTape::BYTES,                             // The values are bytes
     CommandTape::FIXED,                             // After the map there is a Fixed amount of bytes
     0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // The amount of bytes is 0x0F
-    CommandTape::BYTES,                             // The type of the values in the map
 ];
 const HEADER_JSON: &str = r#"{"type": "record","name": "org.apache.avro.file.HeaderNoMagic","fields": [{"name": "meta", "type": {"type": "map", "values": "bytes"}},{"name": "sync", "type": {"type": "fixed", "name": "Sync", "size": 16}}]}"#;
 
@@ -177,11 +176,9 @@ impl StateMachine for ObjectContainerFileHeaderStateMachine {
                 let _ = self.fsm.insert(fsm);
                 Ok(StateMachineControlFlow::NeedMore(self))
             }
-            StateMachineControlFlow::Done(tape) => {
-                Ok(StateMachineControlFlow::Done(
-                    ObjectContainerFileHeader::from_tape(tape)?,
-                ))
-            }
+            StateMachineControlFlow::Done(tape) => Ok(StateMachineControlFlow::Done(
+                ObjectContainerFileHeader::from_tape(tape)?,
+            )),
         }
     }
 }
