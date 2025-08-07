@@ -14,7 +14,7 @@ use crate::{
             ObjectContainerFileBodyStateMachine, ObjectContainerFileHeader,
             ObjectContainerFileHeaderStateMachine,
         },
-        schema_to_command_tape, value_from_tape,
+        value_from_tape,
     },
     types::Value,
 };

@@ -32,7 +32,7 @@ pub struct UnionVariants {
 }
 
 impl UnionVariants {
-    pub fn get(mut self, index: usize) -> Result<ToRead, Error> {
+    pub fn get(mut self, index: usize) -> Result<CommandTape, Error> {
         if index >= self.num_variants {
             return Err(Details::GetUnionVariant {
                 index: index as i64,
@@ -42,15 +42,16 @@ impl UnionVariants {
         }
         // Skip past the other variants
         self.tape.skip(index);
-        // Get the command for the variant
-        Ok(self.tape.command().expect("Unreachable!"))
+        let offset = self.tape.read_range.next().expect("Unreachable!");
+        // Return the next command as the command tape
+        Ok(self.tape.extract(offset, 1))
     }
 }
 
 /// A section of a tape of commands.
 ///
 /// This has a reference to the entire tape, so that references to types (for Union,Map,Array) can be resolved.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[must_use]
 pub struct CommandTape {
     inner: Arc<[u8]>,
@@ -350,7 +351,7 @@ impl<'a> CommandTapeBuilder<'a> {
                 self.tape.push(CommandTape::BLOCK);
                 self.tape.push(CommandTape::STRING);
                 let commands = self.add_schema(types, 15)?;
-                self.tape[block_offset] = CommandTape::BLOCK | (commands + 1 << 4) as u8;
+                self.tape[block_offset] = CommandTape::BLOCK | ((commands + 1) << 4) as u8;
                 Ok(1)
             }
             Schema::Union(UnionSchema { schemas, .. }) => {

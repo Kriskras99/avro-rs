@@ -7,7 +7,7 @@ use crate::{
     error::Details,
     state_machines::reading::{
         CommandTape, ItemRead, StateMachine, StateMachineControlFlow, StateMachineResult,
-        decode_zigzag, object::ObjectStateMachine,
+        decode_zigzag_buffer, object::ObjectStateMachine,
     },
 };
 
@@ -30,7 +30,7 @@ const HEADER_TAPE: &[u8] = &[
     CommandTape::STRING,                            // The keys are strings
     CommandTape::BYTES,                             // The values are bytes
     CommandTape::FIXED,                             // After the map there is a Fixed amount of bytes
-    0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // The amount of bytes is 0x0F
+    0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // The amount of bytes is 0x0F
 ];
 const HEADER_JSON: &str = r#"{"type": "record","name": "org.apache.avro.file.HeaderNoMagic","fields": [{"name": "meta", "type": {"type": "map", "values": "bytes"}},{"name": "sync", "type": {"type": "fixed", "name": "Sync", "size": 16}}]}"#;
 
@@ -225,7 +225,7 @@ impl StateMachine for ObjectContainerFileBodyStateMachine {
                 }
                 self.need_to_read_sync = false;
             }
-            let Some(block) = decode_zigzag(buffer)? else {
+            let Some(block) = decode_zigzag_buffer(buffer)? else {
                 // Not enough data left in the buffer
                 return Ok(StateMachineControlFlow::NeedMore(self));
             };
@@ -242,7 +242,7 @@ impl StateMachine for ObjectContainerFileBodyStateMachine {
             self.left_in_block = abs_block;
         }
         if self.need_to_read_block_byte_size {
-            let Some(block) = decode_zigzag(buffer)? else {
+            let Some(block) = decode_zigzag_buffer(buffer)? else {
                 // Not enough data left in the buffer
                 return Ok(StateMachineControlFlow::NeedMore(self));
             };
@@ -261,5 +261,19 @@ impl StateMachine for ObjectContainerFileBodyStateMachine {
                 Ok(StateMachineControlFlow::Done(Some((result, self))))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::{state_machines::reading::{commands::CommandTape, object_container_file::{HEADER_JSON, HEADER_TAPE}}, Schema};
+
+    #[test]
+    pub fn header_tape() {
+        let schema = Schema::parse_str(HEADER_JSON).unwrap();
+        let tape = CommandTape::build_from_schema(&schema).unwrap();
+        assert_eq!(tape, CommandTape::new(Arc::from(HEADER_TAPE)));
     }
 }

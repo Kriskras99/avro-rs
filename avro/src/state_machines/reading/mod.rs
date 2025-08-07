@@ -1,19 +1,10 @@
-use std::{ops::RangeInclusive, sync::Arc};
-
 use oval::Buffer;
 use serde::Deserialize;
 
 use crate::{
-    Error, Schema,
-    error::Details,
-    schema::{ArraySchema, DecimalSchema, FixedSchema},
-    state_machines::reading::{
-        block::{ArrayStateMachine, MapStateMachine},
-        bytes::BytesStateMachine,
-        commands::CommandTape,
-        object::ObjectStateMachine,
-    },
-    types::Value,
+    error::Details, state_machines::reading::{
+        block::BlockStateMachine, bytes::BytesStateMachine, commands::{CommandTape, UnionVariants}, object::ObjectStateMachine
+    }, types::Value, Error, Schema
 };
 
 pub mod async_impl;
@@ -63,10 +54,9 @@ pub enum SubStateMachine {
     Bytes(BytesStateMachine),
     String(BytesStateMachine),
     Fixed(BytesStateMachine),
-    Array(ArrayStateMachine),
-    Map(MapStateMachine),
+    Block(BlockStateMachine),
     Object(ObjectStateMachine),
-    Union(Box<[CommandTape]>),
+    Union(UnionVariants),
 }
 
 /// A item that was read from the document.
@@ -96,12 +86,21 @@ pub enum ItemRead {
 /// Will only consume the buffer if a whole number has been read.
 /// If insufficient bytes are available it will return `Ok(None)` to
 /// indicate it needs more bytes.
-pub fn decode_zigzag(buffer: &mut Buffer) -> Result<Option<i64>, Error> {
+pub fn decode_zigzag_buffer(buffer: &mut Buffer) -> Result<Option<i64>, Error> {
+    if let Some((decoded, consumed)) = decode_zigzag_slice(buffer.data())? {
+        buffer.consume(consumed);
+        Ok(Some(decoded))
+    } else {
+        Ok(None)
+    }
+}
+
+pub fn decode_zigzag_slice(buffer: &[u8]) -> Result<Option<(i64, usize)>, Error> {
     let mut decoded = 0;
     let mut loops_done = 0;
     let mut last_byte = 0;
 
-    for (counter, &byte) in buffer.data().iter().take(9).enumerate() {
+    for (counter, &byte) in buffer.iter().take(9).enumerate() {
         let byte = u64::from(byte);
         decoded |= (byte & 0x7F) << (counter * 7);
         loops_done = counter;
@@ -118,11 +117,10 @@ pub fn decode_zigzag(buffer: &mut Buffer) -> Result<Option<i64>, Error> {
             Ok(None)
         }
     } else {
-        buffer.consume(loops_done);
         if decoded & 0x1 == 0 {
-            Ok(Some((decoded >> 1) as i64))
+            Ok(Some(((decoded >> 1) as i64, loops_done)))
         } else {
-            Ok(Some(!(decoded >> 1) as i64))
+            Ok(Some((!(decoded >> 1) as i64, loops_done)))
         }
     }
 }
