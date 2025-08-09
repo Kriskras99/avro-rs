@@ -7,10 +7,8 @@ use crate::{
     error::Details,
     state_machines::reading::{
         CommandTape, ItemRead, StateMachine, StateMachineControlFlow, SubStateMachine,
-        block::BlockStateMachine,
-        bytes::BytesStateMachine,
-        commands::ToRead,
-        decode_zigzag_buffer, replace_drop,
+        block::BlockStateMachine, bytes::BytesStateMachine, commands::ToRead, decode_zigzag_buffer,
+        replace_drop,
     },
 };
 
@@ -169,18 +167,24 @@ impl StateMachine for ObjectStateMachine {
                             }
                         }
                         ToRead::Block(command_tape) => {
-                            let fsm = BlockStateMachine::new(command_tape, std::mem::take(&mut self.tape));
+                            let fsm = BlockStateMachine::new(
+                                command_tape,
+                                std::mem::take(&mut self.tape),
+                            );
                             // Optimistically run the state machine
                             match fsm.parse(buffer)? {
                                 StateMachineControlFlow::NeedMore(fsm) => {
-                                    replace_drop(self.current_sub_machine.deref_mut(), SubStateMachine::Block(fsm));
+                                    replace_drop(
+                                        self.current_sub_machine.deref_mut(),
+                                        SubStateMachine::Block(fsm),
+                                    );
                                     return Ok(StateMachineControlFlow::NeedMore(self));
-                                },
+                                }
                                 StateMachineControlFlow::Done(tape) => {
                                     self.tape = tape;
-                                },
+                                }
                             }
-                        },
+                        }
                         ToRead::Union(variants) => {
                             // Optimistically try to get the variant
                             let Some(index) = decode_zigzag_buffer(buffer)? else {
@@ -214,16 +218,22 @@ impl StateMachine for ObjectStateMachine {
                             }
                         }
                         ToRead::Ref(command_tape) => {
-                            let fsm = ObjectStateMachine::new_with_tape(command_tape, std::mem::take(&mut self.tape));
+                            let fsm = ObjectStateMachine::new_with_tape(
+                                command_tape,
+                                std::mem::take(&mut self.tape),
+                            );
                             // Optimistically run the state machine
                             match fsm.parse(buffer)? {
                                 StateMachineControlFlow::NeedMore(fsm) => {
-                                    replace_drop(self.current_sub_machine.deref_mut(), SubStateMachine::Object(fsm));
+                                    replace_drop(
+                                        self.current_sub_machine.deref_mut(),
+                                        SubStateMachine::Object(fsm),
+                                    );
                                     return Ok(StateMachineControlFlow::NeedMore(self));
-                                },
+                                }
                                 StateMachineControlFlow::Done(tape) => {
                                     self.tape = tape;
-                                },
+                                }
                             }
                         }
                     }

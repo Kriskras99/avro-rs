@@ -2,19 +2,25 @@ use oval::Buffer;
 use serde::Deserialize;
 
 use crate::{
-    error::Details, state_machines::reading::{
-        block::BlockStateMachine, bytes::BytesStateMachine, commands::{CommandTape, UnionVariants}, object::ObjectStateMachine
-    }, types::Value, Error, Schema
+    Error, Schema,
+    error::Details,
+    state_machines::reading::{
+        block::BlockStateMachine,
+        bytes::BytesStateMachine,
+        commands::{CommandTape, UnionVariants},
+        object::ObjectStateMachine,
+    },
+    types::Value,
 };
 
 pub mod async_impl;
 pub mod block;
 pub mod bytes;
+pub mod codec;
 mod commands;
 pub mod object;
 mod object_container_file;
 pub mod sync;
-pub mod codec;
 
 pub trait StateMachine: Sized {
     type Output: Sized;

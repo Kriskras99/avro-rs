@@ -269,7 +269,13 @@ impl StateMachine for ObjectContainerFileBodyStateMachine {
 mod tests {
     use std::sync::Arc;
 
-    use crate::{state_machines::reading::{commands::CommandTape, object_container_file::{HEADER_JSON, HEADER_TAPE}}, Schema};
+    use crate::{
+        Schema,
+        state_machines::reading::{
+            commands::CommandTape,
+            object_container_file::{HEADER_JSON, HEADER_TAPE},
+        },
+    };
 
     #[test]
     pub fn header_tape() {
