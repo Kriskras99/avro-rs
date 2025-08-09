@@ -258,6 +258,7 @@ impl StateMachine for ObjectContainerFileBodyStateMachine {
             }
             StateMachineControlFlow::Done(result) => {
                 self.fsm.replace(ObjectStateMachine::new(self.tape.clone()));
+                self.left_in_block -= 1;
                 Ok(StateMachineControlFlow::Done(Some((result, self))))
             }
         }

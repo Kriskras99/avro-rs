@@ -14,6 +14,7 @@ mod commands;
 pub mod object;
 mod object_container_file;
 pub mod sync;
+pub mod codec;
 
 pub trait StateMachine: Sized {
     type Output: Sized;

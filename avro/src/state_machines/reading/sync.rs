@@ -19,8 +19,6 @@ use crate::{
     types::Value,
 };
 
-// This should probably also be a state machine and be wrapped in sync and async versions.
-// But this suffices for the demonstration.
 pub struct ObjectContainerFileReader<'a, R> {
     reader_schema: Option<&'a Schema>,
     header: ObjectContainerFileHeader,
@@ -68,9 +66,6 @@ impl<'a, R: Read> ObjectContainerFileReader<'a, R> {
     }
 
     /// Get the next object in the file
-    ///
-    /// # Panics
-    /// Will panic if the file is already finished.
     fn next_object(&mut self) -> Option<Result<Vec<ItemRead>, Error>> {
         if let Some(mut fsm) = self.fsm.take() {
             loop {
