@@ -50,9 +50,12 @@ impl Error {
     }
 }
 
-impl From<Details> for Error {
-    fn from(details: Details) -> Self {
-        Self::new(details)
+impl<T> From<T> for Error
+where
+    T: Into<Details>,
+{
+    fn from(value: T) -> Self {
+        Self::new(value.into())
     }
 }
 
@@ -70,38 +73,47 @@ impl serde::de::Error for Error {
 
 #[derive(thiserror::Error)]
 pub enum Details {
+    /// Calculated CRC of Snappy decompressed data did not match the included CRC.
     #[error("Bad Snappy CRC32; expected {expected:x} but got {actual:x}")]
     SnappyCrc32 { expected: u32, actual: u32 },
 
+    /// Expected a boolean but got something else than `0` or `1`.
     #[error("Invalid u8 for bool: {0}")]
     BoolValue(u8),
 
+    /// Expected a [`Value::Fixed`] for a [`Value::Decimal`] but got something else.
     #[error("Not a fixed value, required for decimal with fixed schema: {0:?}")]
     FixedValue(Value),
 
+    /// Expected a [`Value::Bytes`] for a [`Value::Decimal`] but got something else.
     #[error("Not a bytes value, required for decimal with bytes schema: {0:?}")]
     BytesValue(Value),
 
+    /// Expected a String for a UUID but got something else.
     #[error("Not a string value, required for uuid: {0:?}")]
     GetUuidFromStringValue(Value),
 
+    /// Got a list of schemas were two schemas had the same fully qualified name.
     #[error("Two schemas with the same fullname were given: {0:?}")]
     NameCollision(String),
 
+    /// Invalid [`Schema::Decimal`] the inner type must be a [`Value::Bytes`] or [`Value::Fixed`].
     #[error("Not a fixed or bytes type, required for decimal schema, got: {0:?}")]
     ResolveDecimalSchema(SchemaKind),
 
+    /// Failed to decode a string as UTF-8.
     #[error("Invalid utf-8 string")]
-    ConvertToUtf8(#[source] std::string::FromUtf8Error),
+    ConvertToUtf8(#[from] std::string::FromUtf8Error),
 
+    /// Failed to decode a string as UTF-8.
     #[error("Invalid utf-8 string")]
-    ConvertToUtf8Error(#[source] std::str::Utf8Error),
+    ConvertToUtf8Error(#[from] std::str::Utf8Error),
 
-    /// Describes errors happened while validating Avro data.
+    /// The [`Value`] to encode is not compatible with the provided schema.
     #[error("Value does not match schema")]
     Validation,
 
-    /// Describes errors happened while validating Avro data.
+    /// The [`Value`] to encode is not compatible with the provided schema.
     #[error("Value {value:?} does not match schema {schema:?}: Reason: {reason}")]
     ValidationWithReason {
         value: Value,
@@ -109,39 +121,52 @@ pub enum Details {
         reason: String,
     },
 
+    /// Decoding the input would result in an allocation larger than allowed.
+    ///
+    /// The default maximum value is [`DEFAULT_MAX_ALLOCATION_BYTES`](crate::DEFAULT_MAX_ALLOCATION_BYTES),
+    /// and can be changed with [`max_allocation_bytes`](crate::max_allocation_bytes).
     #[error("Unable to allocate {desired} bytes (maximum allowed: {maximum})")]
     MemoryAllocation { desired: usize, maximum: usize },
 
-    /// Describe a specific error happening with decimal representation
+    /// The [`Value::Decimal`] does not fit in the `requested` amount of bytes, needs at least `needed`.
     #[error(
         "Number of bytes requested for decimal sign extension {requested} is less than the number of bytes needed to decode {needed}"
     )]
     SignExtend { requested: usize, needed: usize },
 
+    /// Failed to read a [`Value::Boolean`].
     #[error("Failed to read boolean bytes: {0}")]
     ReadBoolean(#[source] std::io::Error),
 
+    /// Failed to read a [`Value::Bytes`].
     #[error("Failed to read bytes: {0}")]
     ReadBytes(#[source] std::io::Error),
 
+    /// Failed to read a [`Value::String`].
     #[error("Failed to read string: {0}")]
     ReadString(#[source] std::io::Error),
 
+    /// Failed to read a [`Value::Double`].
     #[error("Failed to read double: {0}")]
     ReadDouble(#[source] std::io::Error),
 
+    /// Failed to read a [`Value::Float`].
     #[error("Failed to read float: {0}")]
     ReadFloat(#[source] std::io::Error),
 
+    /// Failed to read a [`Value::Duration`].
     #[error("Failed to read duration: {0}")]
     ReadDuration(#[source] std::io::Error),
 
-    #[error("Failed to read fixed number of bytes '{1}': : {0}")]
+    /// Failed to read a [`Value::Fixed`].
+    #[error("Failed to read fixed number of bytes '{1}': {0}")]
     ReadFixed(#[source] std::io::Error, usize),
 
+    /// Failed to parse a UUID from a string.
     #[error("Failed to convert &str to UUID: {0}")]
     ConvertStrToUuid(#[source] uuid::Error),
 
+    ///
     #[error("Failed to convert Fixed bytes to UUID. It must be exactly 16 bytes, got {0}")]
     ConvertFixedToUuid(usize),
 

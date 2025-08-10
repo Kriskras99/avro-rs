@@ -257,10 +257,7 @@ fn read_codec(metadata: &HashMap<String, Value>) -> AvroResult<Codec> {
         .get("avro.codec")
         .map(|codec| {
             if let Value::Bytes(ref bytes) = *codec {
-                match std::str::from_utf8(bytes.as_ref()) {
-                    Ok(utf8) => Ok(utf8),
-                    Err(utf8_error) => Err(Details::ConvertToUtf8Error(utf8_error).into()),
-                }
+                std::str::from_utf8(&bytes).map_err(Error::from)
             } else {
                 Err(Details::BadCodecMetadata.into())
             }

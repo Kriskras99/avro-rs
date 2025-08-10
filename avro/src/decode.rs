@@ -221,9 +221,7 @@ pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
             let len = decode_len(reader)?;
             let mut buf = vec![0u8; len];
             match reader.read_exact(&mut buf) {
-                Ok(_) => Ok(Value::String(
-                    String::from_utf8(buf).map_err(Details::ConvertToUtf8)?,
-                )),
+                Ok(_) => Ok(Value::String(String::from_utf8(buf)?)),
                 Err(io_err) => {
                     if let ErrorKind::UnexpectedEof = io_err.kind() {
                         Ok(Value::Null)

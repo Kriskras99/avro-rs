@@ -951,9 +951,9 @@ impl Value {
     fn resolve_string(self) -> Result<Self, Error> {
         match self {
             Value::String(s) => Ok(Value::String(s)),
-            Value::Bytes(bytes) | Value::Fixed(_, bytes) => Ok(Value::String(
-                String::from_utf8(bytes).map_err(Details::ConvertToUtf8)?,
-            )),
+            Value::Bytes(bytes) | Value::Fixed(_, bytes) => {
+                Ok(Value::String(String::from_utf8(bytes)?))
+            }
             other => Err(Details::GetString(other).into()),
         }
     }

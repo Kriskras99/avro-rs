@@ -28,7 +28,7 @@ use std::{
 /// Maximum number of bytes that can be allocated when decoding
 /// Avro-encoded values. This is a protection against ill-formed
 /// data, whose length field might be interpreted as enormous.
-/// See max_allocation_bytes to change this limit.
+/// See [`max_allocation_bytes`] to change this limit.
 pub const DEFAULT_MAX_ALLOCATION_BYTES: usize = 512 * 1024 * 1024;
 static MAX_ALLOCATION_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_ALLOCATION_BYTES);
 static MAX_ALLOCATION_BYTES_ONCE: Once = Once::new();
@@ -147,6 +147,8 @@ fn decode_variable<R: Read>(reader: &mut R) -> AvroResult<u64> {
 /// Set a new maximum number of bytes that can be allocated when decoding data.
 /// Once called, the limit cannot be changed.
 ///
+/// Defaults to [`DEFAULT_MAX_ALLOCATION_BYTES`].
+///
 /// **NOTE** This function must be called before decoding **any** data. The
 /// library leverages [`std::sync::Once`](https://doc.rust-lang.org/std/sync/struct.Once.html)
 /// to set the limit either when calling this method, or when decoding for
@@ -173,7 +175,7 @@ pub fn safe_len(len: usize) -> AvroResult<usize> {
 }
 
 /// Set whether serializing/deserializing is marked as human readable in serde traits.
-/// This will adjust the return value of `is_human_readable()` for both.
+/// This will adjust the return value of [`is_human_readable()`] for both.
 /// Once called, the value cannot be changed.
 ///
 /// **NOTE** This function must be called before serializing/deserializing **any** data. The
