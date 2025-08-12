@@ -81,14 +81,15 @@ pub enum Details {
     #[error("Invalid u8 for bool: {0}")]
     BoolValue(u8),
 
-    /// Expected a [`Value::Fixed`] for a [`Value::Decimal`] but got something else.
     #[error("Not a fixed value, required for decimal with fixed schema: {0:?}")]
+    #[deprecated(since = "0.20.0", note = "This error variant is not generated anymore")]
     FixedValue(Value),
 
-    /// Expected a [`Value::Bytes`] for a [`Value::Decimal`] but got something else.
     #[error("Not a bytes value, required for decimal with bytes schema: {0:?}")]
+    #[deprecated(since = "0.20.0", note = "This error variant is not generated anymore")]
     BytesValue(Value),
 
+    // TODO: Remove
     /// Expected a String for a UUID but got something else.
     #[error("Not a string value, required for uuid: {0:?}")]
     GetUuidFromStringValue(Value),
@@ -162,20 +163,24 @@ pub enum Details {
     #[error("Failed to read fixed number of bytes '{1}': {0}")]
     ReadFixed(#[source] std::io::Error, usize),
 
+    // TODO: Merge with other uuid::Error?
     /// Failed to parse a UUID from a string.
     #[error("Failed to convert &str to UUID: {0}")]
     ConvertStrToUuid(#[source] uuid::Error),
 
-    ///
+    // TODO: Remove
     #[error("Failed to convert Fixed bytes to UUID. It must be exactly 16 bytes, got {0}")]
     ConvertFixedToUuid(usize),
 
+    /// Failed to parse a UUID from a byte slice.
     #[error("Failed to convert Fixed bytes to UUID: {0}")]
     ConvertSliceToUuid(#[source] uuid::Error),
 
     #[error("Map key is not a string; key type is {0:?}")]
+    #[deprecated(since = "0.20.0", note = "This error variant is not generated anymore")]
     MapKeyType(ValueKind),
 
+    /// Decoded union index is larger than the amount of variants.
     #[error("Union index {index} out of bounds: {num_variants}")]
     GetUnionVariant { index: i64, num_variants: usize },
 
@@ -183,161 +188,232 @@ pub enum Details {
     #[error("Enum symbol index out of bounds: {num_variants}")]
     EnumSymbolIndex { index: usize, num_variants: usize },
 
+    /// The string to encode is not a variant of the enum.
     #[error("Enum symbol not found {0}")]
     GetEnumSymbol(String),
 
     #[error("Unable to decode enum index")]
+    #[deprecated(since = "0.20.0", note = "This error variant is not generated anymore")]
     GetEnumUnknownIndexValue,
 
+    /// Invalid [`Schema::Decimal`], scale is greater than precision.
     #[error("Scale {scale} is greater than precision {precision}")]
     GetScaleAndPrecision { scale: usize, precision: usize },
 
+    /// Invalid [`Schema::Decimal`], the inner [`Schema::Fixed`] is too small to hold values of `precision`.
     #[error(
         "Fixed type number of bytes {size} is not large enough to hold decimal values of precision {precision}"
     )]
     GetScaleWithFixedSize { size: usize, precision: usize },
 
+    // TODO: Split of all the Resolve errors into a separate enum and make a Details::FailedToResolve
+    /// Failed to resolve [`Value::Uuid`], expected [`Value::String`] or [`Value::Uuid`] but got something else.
     #[error("Expected Value::Uuid, got: {0:?}")]
     GetUuid(Value),
 
+    /// Failed to resolve [`Value::BigDecimal`], expected [`Value::Bytes`] or [`Value::BigDecimal`] but got something else.
     #[error("Expected Value::BigDecimal, got: {0:?}")]
     GetBigDecimal(Value),
 
     #[error("Fixed bytes of size 12 expected, got Fixed of size {0}")]
+    #[deprecated(since = "0.20.0", note = "Renamed to Details::GetDurationFixedBytes")]
     GetDecimalFixedBytes(usize),
 
+    /// Failed to resolve [`Value::Duration`], got a [`Value::Fixed`] with a size other than 12.
+    #[error("Fixed bytes of size 12 expected, got Fixed of size {0}")]
+    GetDurationFixedBytes(usize),
+
+    // TODO: Instead of renaming Resolve* to Get*, rename Get* to Resolve* for the Get* that are only returned in the resove functions
     #[error("Expected Value::Duration or Value::Fixed(12), got: {0:?}")]
+    #[deprecated(since = "0.20.0", note = "Renamed to Details::GetDuration")]
     ResolveDuration(Value),
 
+    /// Failed to resolve [`Value::Duration`], expected a [`Value::Fixed`] of size 12 or [`Value::Duration`] but got something else.
+    #[error("Expected Value::Duration or Value::Fixed(12), got: {0:?}")]
+    GetDuration(Value),
+
     #[error("Expected Value::Decimal, Value::Bytes or Value::Fixed, got: {0:?}")]
+    #[deprecated(since = "0.20.0", note = "Renamed to Details::GetDecimal")]
     ResolveDecimal(Value),
 
+    /// Failed to resolve [`Value::Decimal`], expected a [`Value::Bytes`], [`Value::Fixed`] or [`Value::Decimal`] but got something else.
+    #[error("Expected Value::Decimal, Value::Bytes or Value::Fixed, got: {0:?}")]
+    GetDecimal(Value),
+
+    /// Failed to resolve [`Value::Record`], missing a field which does not have a default.
     #[error("Missing field in record: {0:?}")]
     GetField(String),
 
-    #[error("Unable to convert to u8, got {0:?}")]
-    GetU8(Value),
-
+    // TODO: Rename to Get* or Resolve*?
+    /// Failed to resolve [`Value::Decimal`], the [`Value::Bytes`] or [`Value::Fixed`] is too small to hold values of `precision`.
     #[error("Precision {precision} too small to hold decimal values with {num_bytes} bytes")]
     ComparePrecisionAndSize { precision: usize, num_bytes: usize },
 
+    // TODO: Rename to Get* or Resolve*?
+    /// Failed to resolve [`Value::Decimal`], the size of [`Value::Bytes`] or [`Value::Fixed`] is too large.
     #[error("Cannot convert length to i32: {1}")]
     ConvertLengthToI32(#[source] std::num::TryFromIntError, usize),
 
+    /// Failed to resolve [`Value::Date`], expected [`Value::Int`] or [`Value::Date`] but got something else.
     #[error("Expected Value::Date or Value::Int, got: {0:?}")]
     GetDate(Value),
 
+    /// Failed to resolve [`Value::TimeMillis`], expected [`Value::Int`] or [`Value::TimeMillis`] but got something else.
     #[error("Expected Value::TimeMillis or Value::Int, got: {0:?}")]
     GetTimeMillis(Value),
 
+    /// Failed to resolve [`Value::TimeMicros`], expected [`Value::Int`], [`Value::Long`] or [`Value::TimeMicros`] but got something else.
     #[error("Expected Value::TimeMicros, Value::Long or Value::Int, got: {0:?}")]
     GetTimeMicros(Value),
 
+    /// Failed to resolve [`Value::TimestampMillis`], expected [`Value::Int`], [`Value::Long`] or [`Value::TimestampMillis`] but got something else.
     #[error("Expected Value::TimestampMillis, Value::Long or Value::Int, got: {0:?}")]
     GetTimestampMillis(Value),
 
+    /// Failed to resolve [`Value::TimestampMicros`], expected [`Value::Int`], [`Value::Long`] or [`Value::TimestampMicros`] but got something else.
     #[error("Expected Value::TimestampMicros, Value::Long or Value::Int, got: {0:?}")]
     GetTimestampMicros(Value),
 
+    /// Failed to resolve [`Value::TimestampNanos`], expected [`Value::Int`], [`Value::Long`] or [`Value::TimestampNanos`] but got something else.
     #[error("Expected Value::TimestampNanos, Value::Long or Value::Int, got: {0:?}")]
     GetTimestampNanos(Value),
 
+    /// Failed to resolve [`Value::LocalTimestampMillis`], expected [`Value::Int`], [`Value::Long`] or [`Value::LocalTimestampMillis`] but got something else.
     #[error("Expected Value::LocalTimestampMillis, Value::Long or Value::Int, got: {0:?}")]
     GetLocalTimestampMillis(Value),
 
+    /// Failed to resolve [`Value::LocalTimestampMicros`], expected [`Value::Int`], [`Value::Long`] or [`Value::LocalTimestampMicros`] but got something else.
     #[error("Expected Value::LocalTimestampMicros, Value::Long or Value::Int, got: {0:?}")]
     GetLocalTimestampMicros(Value),
 
+    /// Failed to resolve [`Value::LocalTimestampNanos`], expected [`Value::Int`], [`Value::Long`] or [`Value::LocalTimestampNanos`] but got something else.
     #[error("Expected Value::LocalTimestampNanos, Value::Long or Value::Int, got: {0:?}")]
     GetLocalTimestampNanos(Value),
 
+    /// Failed to resolve [`Value::Null`], expected [`Value::Null`] but got something else.
     #[error("Expected Value::Null, got: {0:?}")]
     GetNull(Value),
 
+    /// Failed to resolve [`Value::Boolean`], expected [`Value::Boolean`] but got something else.
     #[error("Expected Value::Boolean, got: {0:?}")]
     GetBoolean(Value),
 
+    /// Failed to resolve [`Value::Int`], expected [`Value::Int`] but got something else.
     #[error("Expected Value::Int, got: {0:?}")]
     GetInt(Value),
 
+    /// Failed to resolve [`Value::Long`], expected [`Value::Int`] or [`Value::Long`] but got something else.
     #[error("Expected Value::Long or Value::Int, got: {0:?}")]
     GetLong(Value),
 
+    /// Failed to resolve [`Value::Double`], expected [`Value::Int`], [`Value::Long`], [`Value::Float`], [`Value::String`] with values `NaN`, `INF`, `Infinity`, `-INF`, `-Infinity`, or [`Value::Double`] but got something else.
     #[error(r#"Expected Value::Double, Value::Float, Value::Int, Value::Long or Value::String ("NaN", "INF", "Infinity", "-INF" or "-Infinity"), got: {0:?}"#)]
     GetDouble(Value),
 
+    /// Failed to resolve [`Value::Float`], expected [`Value::Int`], [`Value::Long`], [`Value::Doube`], [`Value::String`] with values `NaN`, `INF`, `Infinity`, `-INF`, `-Infinity`, or [`Value::Float`] but got something else.
     #[error(r#"Expected Value::Float, Value::Double, Value::Int, Value::Long or Value::String ("NaN", "INF", "Infinity", "-INF" or "-Infinity"), got: {0:?}"#)]
     GetFloat(Value),
 
+    /// Failed to resolve [`Value::Bytes`], expected a [`Value::Array`] of integers, [`Value::String`] or [`Value::Bytes`].
     #[error("Expected Value::Bytes, got: {0:?}")]
     GetBytes(Value),
 
+    /// Failed to resolve [`Value::Bytes`], got a [`Value::Array`] of integers but one of the values is outside the valid range for `u8`.
+    #[error("Unable to convert to u8, got {0:?}")]
+    GetU8(i32),
+
+    /// Failed to resolve [`Value::String`], expected [`Value::Bytes`], [`Value::Fixed`] or [`Value::String`] but got something else.
     #[error("Expected Value::String, Value::Bytes or Value::Fixed, got: {0:?}")]
     GetString(Value),
 
+    /// Failed to resolve [`Value::Enum`], expected [`Value::Enum`] but got something else.
     #[error("Expected Value::Enum, got: {0:?}")]
     GetEnum(Value),
 
+    // TODO: Move this away from the resolve errors
+    /// Failed to serialize [`Value::Decimal`], the [`Value::Fixed`] size does not match the decimal length.
     #[error("Fixed size mismatch, expected: {size}, got: {n}")]
     CompareFixedSizes { size: usize, n: usize },
 
     #[error("String expected for fixed, got: {0:?}")]
+    #[deprecated(since = "0.20.0", note = "Renamed to Details::GetFixed")]
     GetStringForFixed(Value),
 
+    /// Failed to resolve [`Value::Fixed`], expected [`Value::Bytes`], [`Value::Fixed`] or [`Value::String`] of `size` bytes but got something else.
+    #[error("Expected Value::Fixed, Value::Bytes or Value::String of size {size}, got: {got:?}")]
+    GetFixed { size: usize, got: Value },
+
+    /// The enum default value is not on the list of symbols.
     #[error("Enum default {symbol:?} is not among allowed symbols {symbols:?}")]
     GetEnumDefault {
         symbol: String,
         symbols: Vec<String>,
     },
 
+    /// Failed to decode [`Value::Enum`], the index is larger than the amount of symbols.
     #[error("Enum value index {index} is out of bounds {nsymbols}")]
     GetEnumValue { index: usize, nsymbols: usize },
 
-    #[error("Key {0} not found in decimal metadata JSON")]
-    GetDecimalMetadataFromJson(&'static str),
+    /// Precision key not in Decimal JSON.
+    #[error("Precision not found in decimal metadata JSON")]
+    GetDecimalMetadataFromJson,
 
+    /// Failed to resolve [`Value::Union`], `value` does not match any of the variants.
     #[error("Could not find matching type in {schema:?} for {value:?}")]
     FindUnionVariant { schema: UnionSchema, value: Value },
 
+    /// Union doesn't have any variants.
     #[error("Union type should not be empty")]
     EmptyUnion,
 
+    /// Failed to resolve [`Value::Array`], expected [`Value::Array`] but got something else.
     #[error("Array({expected:?}) expected, got {other:?}")]
     GetArray { expected: SchemaKind, other: Value },
 
+    /// Failed to resolve [`Value::Map`], expected [`Value::Map`] but got something else.
     #[error("Map({expected:?}) expected, got {other:?}")]
     GetMap { expected: SchemaKind, other: Value },
 
+    /// Failed to resolve [`Value::Record`], expected [`Value::Map`] or [`Value::Record`] but got something else.
     #[error("Record with fields {expected:?} expected, got {other:?}")]
     GetRecord {
         expected: Vec<(String, SchemaKind)>,
         other: Value,
     },
 
+    /// No `name` field in the schema.
     #[error("No `name` field")]
     GetNameField,
 
+    /// No `name` field in the record field schema.
     #[error("No `name` in record field")]
     GetNameFieldFromRecord,
 
+    /// Union schema contains a directly nested union.
     #[error("Unions may not directly contain a union")]
     GetNestedUnion,
 
+    /// Union schema contains duplicate types.
     #[error("Unions cannot contain duplicate types")]
     GetUnionDuplicate,
 
+    /// The union default does not match the type of any of the variants.
     #[error("One union type {0:?} must match the `default`'s value type {1:?}")]
     GetDefaultUnion(SchemaKind, ValueKind),
 
+    /// The default of a record field does not match the type of the record field.
     #[error("`default`'s value type of field {0:?} in {1:?} must be {2:?}")]
     GetDefaultRecordField(String, String, String),
 
     #[error("JSON value {0} claims to be u64 but cannot be converted")]
+    #[deprecated(since = "0.20.0", note = "This error variant is not generated anymore")]
     GetU64FromJson(serde_json::Number),
 
     #[error("JSON value {0} claims to be i64 but cannot be converted")]
+    #[deprecated(since = "0.20.0", note = "This error variant is not generated anymore")]
     GetI64FromJson(serde_json::Number),
 
+    /// Failed to convert a `u64` to `usize`.
     #[error("Cannot convert u64 to usize: {1}")]
     ConvertU64ToUsize(#[source] std::num::TryFromIntError, u64),
 
@@ -345,36 +421,50 @@ pub enum Details {
     #[error("Cannot convert u32 to usize: {1}")]
     ConvertU32ToUsize(#[source] std::num::TryFromIntError, u32),
 
+    /// Failed to convert a `i64` to `usize`.
     #[error("Cannot convert i64 to usize: {1}")]
     ConvertI64ToUsize(#[source] std::num::TryFromIntError, i64),
 
+    /// Failed to convert a `i32` to `usize`.
     #[error("Cannot convert i32 to usize: {1}")]
     ConvertI32ToUsize(#[source] std::num::TryFromIntError, i32),
 
+    /// Decimal schema precision and/or scale is not a `u64` or `i64`.
     #[error("Invalid JSON value for decimal precision/scale integer: {0}")]
     GetPrecisionOrScaleFromJson(serde_json::Number),
 
+    /// Schema is not valid JSON.
     #[error("Failed to parse schema from JSON")]
     ParseSchemaJson(#[source] serde_json::Error),
 
+    /// Failed to read the schema.
     #[error("Failed to read schema")]
     ReadSchemaFromReader(#[source] std::io::Error),
 
+    /// Failed to parse the schema.
     #[error("Must be a JSON string, object or array")]
     ParseSchemaFromValidJson,
 
     #[error("Unknown primitive type: {0}")]
+    #[deprecated(since = "0.20.0", note = "Renamed to Details::FindNamedReference")]
     ParsePrimitive(String),
 
+    /// Failed to find named schema for a [`Schema::Ref`].
+    #[error("Failed to find named reference: {0}")]
+    FindNamedSchema(String),
+
+    /// Failed to parse a [`Schema::Decimal`], expected a [`Value::Number`](serde_json::Value::Number) for `key` but got something else.
     #[error("invalid JSON for {key:?}: {value:?}")]
     GetDecimalMetadataValueFromJson {
         key: String,
         value: serde_json::Value,
     },
 
+    /// Failed to parse a [`Schema::Decimal`], `precision` must be greater than or equal to `scale`.
     #[error("The decimal precision ({precision}) must be bigger or equal to the scale ({scale})")]
     DecimalPrecisionLessThanScale { precision: usize, scale: usize },
 
+    /// Failed to parse a [`Schema::Decimal`], `precision` must be greater than or equal to `1`.
     #[error("The decimal precision ({precision}) must be a positive number")]
     DecimalPrecisionMuBePositive { precision: usize },
 
@@ -382,9 +472,13 @@ pub enum Details {
     #[error("Unreadable big decimal sign")]
     BigDecimalSign,
 
+    // TODO: Is this useful on top of the error returned by parse_len?
+    /// Failed to decode a [`Value::BigDecimal`], the length is unreadable.
     #[error("Unreadable length for big decimal inner bytes: {0}")]
     BigDecimalLen(#[source] Box<Error>),
 
+    // TODO: Why do we include the source for BigDecimalLen but not for BigDecimalScale?
+    /// Failed to decode a [`Value::BigDecimal`], the scale is unreadable.
     #[error("Unreadable big decimal scale")]
     BigDecimalScale,
 
@@ -392,27 +486,41 @@ pub enum Details {
     #[error("Unexpected `type` {0} variant for `logicalType`")]
     GetLogicalTypeVariant(serde_json::Value),
 
+    /// Failed to parse the schema, a `logicalType` is missing the `type` field.
     #[error("No `type` field found for `logicalType`")]
     GetLogicalTypeField,
 
+    /// Failed to parse the schema, a `logicalType` has a `type` field but it's not a string.
     #[error("logicalType must be a string, but is {0:?}")]
     GetLogicalTypeFieldType(serde_json::Value),
 
+    /// Failed to parse the schema, expected a [`Value::String`], [`Value::Array`] or [`Value::Object`] but got something else.
+    ///
+    /// [`Value::String`](serde_json::Value::String)
+    /// [`Value::Array`](serde_json::Value::Array)
+    /// [`Value::Object`](serde_json::Value::Object)
     #[error("Unknown complex type: {0}")]
     GetComplexType(serde_json::Value),
 
+    /// Failed to parse the schema, missing `type` field.
     #[error("No `type` in complex type")]
     GetComplexTypeField,
 
+    /// Failed to parse the schema, a record is missing the `fields` field.
     #[error("No `fields` in record")]
     GetRecordFieldsJson,
 
+    /// Failed to parse the schema, a enum is missing the `symbols` field
     #[error("No `symbols` field in enum")]
     GetEnumSymbolsField,
 
+    /// Failed to parse the schema, the symbols in the `symbols` field are not strings.
     #[error("Unable to parse `symbols` in enum")]
     GetEnumSymbols,
 
+    /// Failed to parse the schema, a symbol in the `symbols` field has an invalid name.
+    ///
+    /// See [`set_enum_symbol_name_validator`](crate::validator::set_enum_symbol_name_validator).
     #[error("Invalid enum symbol name {0}")]
     EnumSymbolName(String),
 
@@ -600,6 +708,7 @@ pub enum Details {
     BadCodecMetadata,
 
     #[error("Cannot convert a slice to Uuid: {0}")]
+    #[deprecated(since = "0.20", note = "Merged with Details::ConvertSliceToUuid")]
     UuidFromSlice(#[source] uuid::Error),
 }
 

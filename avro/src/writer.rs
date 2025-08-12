@@ -438,6 +438,7 @@ impl<'a, W: Write> Writer<'a, W> {
 
         let mut metadata = HashMap::with_capacity(2);
         metadata.insert("avro.schema", Value::Bytes(schema_bytes));
+        // TODO: Don't write codec if codec is null
         metadata.insert("avro.codec", self.codec.into());
         match self.codec {
             #[cfg(feature = "bzip")]

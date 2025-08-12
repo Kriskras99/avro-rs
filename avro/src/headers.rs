@@ -89,7 +89,7 @@ impl GlueSchemaUuidHeader {
             return Err(crate::error::Details::HeaderMagic.into());
         }
         let schema_uuid = Uuid::from_slice(&message_payload[2..18])
-            .map_err(crate::error::Details::UuidFromSlice)?;
+            .map_err(crate::error::Details::ConvertSliceToUuid)?;
         Ok(GlueSchemaUuidHeader { schema_uuid })
     }
 

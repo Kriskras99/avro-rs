@@ -105,22 +105,33 @@ pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
         }
         Schema::Decimal(DecimalSchema { ref inner, .. }) => match &**inner {
             Schema::Fixed { .. } => {
-                match decode_internal(inner, names, enclosing_namespace, reader)? {
-                    Value::Fixed(_, bytes) => Ok(Value::Decimal(Decimal::from(bytes))),
-                    value => Err(Details::FixedValue(value).into()),
-                }
+                let Value::Fixed(_, bytes) =
+                    decode_internal(inner, names, enclosing_namespace, reader)?
+                else {
+                    // Calling decode_internal with Schema::Fixed can only return a Value::Fixed or an error
+                    unreachable!();
+                };
+                Ok(Value::Decimal(Decimal::from(bytes)))
             }
-            Schema::Bytes => match decode_internal(inner, names, enclosing_namespace, reader)? {
-                Value::Bytes(bytes) => Ok(Value::Decimal(Decimal::from(bytes))),
-                value => Err(Details::BytesValue(value).into()),
-            },
+            Schema::Bytes => {
+                let Value::Bytes(bytes) =
+                    decode_internal(inner, names, enclosing_namespace, reader)?
+                else {
+                    // Calling decode_internal with Schema::Bytes can only return a Value::Bytes or an error
+                    unreachable!();
+                };
+                Ok(Value::Decimal(Decimal::from(bytes)))
+            }
             schema => Err(Details::ResolveDecimalSchema(schema.into()).into()),
         },
         Schema::BigDecimal => {
-            match decode_internal(&Schema::Bytes, names, enclosing_namespace, reader)? {
-                Value::Bytes(bytes) => deserialize_big_decimal(&bytes).map(Value::BigDecimal),
-                value => Err(Details::BytesValue(value).into()),
-            }
+            let Value::Bytes(bytes) =
+                decode_internal(&Schema::Bytes, names, enclosing_namespace, reader)?
+            else {
+                // Calling decode_internal with Schema::Bytes can only return a Value::Bytes or an error
+                unreachable!();
+            };
+            deserialize_big_decimal(&bytes).map(Value::BigDecimal)
         }
         Schema::Uuid => {
             let len = decode_len(reader)?;
@@ -271,14 +282,14 @@ pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
 
                 items.reserve(len);
                 for _ in 0..len {
-                    match decode_internal(&Schema::String, names, enclosing_namespace, reader)? {
-                        Value::String(key) => {
-                            let value =
-                                decode_internal(&inner.types, names, enclosing_namespace, reader)?;
-                            items.insert(key, value);
-                        }
-                        value => return Err(Details::MapKeyType(value.into()).into()),
-                    }
+                    let Value::String(key) =
+                        decode_internal(&Schema::String, names, enclosing_namespace, reader)?
+                    else {
+                        // Calling decode_internal with Schema::String can only return a Value::String or an error
+                        unreachable!();
+                    };
+                    let value = decode_internal(&inner.types, names, enclosing_namespace, reader)?;
+                    items.insert(key, value);
                 }
             }
 
@@ -328,22 +339,22 @@ pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
             Ok(Value::Record(items))
         }
         Schema::Enum(EnumSchema { ref symbols, .. }) => {
-            Ok(if let Value::Int(raw_index) = decode_int(reader)? {
-                let index = usize::try_from(raw_index)
-                    .map_err(|e| Details::ConvertI32ToUsize(e, raw_index))?;
-                if (0..symbols.len()).contains(&index) {
-                    let symbol = symbols[index].clone();
-                    Value::Enum(raw_index as u32, symbol)
-                } else {
-                    return Err(Details::GetEnumValue {
-                        index,
-                        nsymbols: symbols.len(),
-                    }
-                    .into());
-                }
+            let Value::Int(raw_index) = decode_int(reader)? else {
+                // Calling decode_int can only return a Value::Int or an error
+                unreachable!()
+            };
+            let index =
+                usize::try_from(raw_index).map_err(|e| Details::ConvertI32ToUsize(e, raw_index))?;
+            if (0..symbols.len()).contains(&index) {
+                let symbol = symbols[index].clone();
+                Ok(Value::Enum(raw_index as u32, symbol))
             } else {
-                return Err(Details::GetEnumUnknownIndexValue.into());
-            })
+                Err(Details::GetEnumValue {
+                    index,
+                    nsymbols: symbols.len(),
+                }
+                .into());
+            }
         }
         Schema::Ref { ref name } => {
             let fully_qualified_name = name.fully_qualified_name(enclosing_namespace);

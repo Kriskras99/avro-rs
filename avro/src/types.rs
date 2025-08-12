@@ -732,14 +732,14 @@ impl Value {
             duration @ Value::Duration { .. } => duration,
             Value::Fixed(size, bytes) => {
                 if size != 12 {
-                    return Err(Details::GetDecimalFixedBytes(size).into());
+                    return Err(Details::GetDurationFixedBytes(size).into());
                 }
                 Value::Duration(Duration::from([
                     bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
                     bytes[8], bytes[9], bytes[10], bytes[11],
                 ]))
             }
-            other => return Err(Details::ResolveDuration(other).into()),
+            other => return Err(Details::GetDuration(other).into()),
         })
     }
 
@@ -882,6 +882,7 @@ impl Value {
     fn resolve_int(self) -> Result<Self, Error> {
         match self {
             Value::Int(n) => Ok(Value::Int(n)),
+            // TODO: This truncates! Value should be checked before allowing this
             Value::Long(n) => Ok(Value::Int(n as i32)),
             other => Err(Details::GetInt(other).into()),
         }
@@ -896,6 +897,7 @@ impl Value {
     }
 
     fn resolve_float(self) -> Result<Self, Error> {
+        // TODO: Should we check for truncation
         match self {
             Value::Int(n) => Ok(Value::Float(n as f32)),
             Value::Long(n) => Ok(Value::Float(n as f32)),
@@ -912,7 +914,7 @@ impl Value {
     fn resolve_double(self) -> Result<Self, Error> {
         match self {
             Value::Int(n) => Ok(Value::Double(f64::from(n))),
-            Value::Long(n) => Ok(Value::Double(n as f64)),
+            Value::Long(n) => Ok(Value::Double(n as f64)), // TODO: Should we check for truncation
             Value::Float(x) => Ok(Value::Double(f64::from(x))),
             Value::Double(x) => Ok(Value::Double(x)),
             Value::String(ref x) => match Self::parse_special_float(x) {
@@ -964,18 +966,24 @@ impl Value {
                 if n == size {
                     Ok(Value::Fixed(n, bytes))
                 } else {
-                    Err(Details::CompareFixedSizes { size, n }.into())
+                    Err(Details::GetFixed { size, got: self }.into())
                 }
             }
-            Value::String(s) => Ok(Value::Fixed(s.len(), s.into_bytes())),
+            Value::String(s) => {
+                if s.len() == size {
+                    Ok(Value::Fixed(s.len(), s.into_bytes()))
+                } else {
+                    Err(Details::GetFixed { size, got: self }.into())
+                }
+            }
             Value::Bytes(s) => {
                 if s.len() == size {
                     Ok(Value::Fixed(size, s))
                 } else {
-                    Err(Details::CompareFixedSizes { size, n: s.len() }.into())
+                    Err(Details::GetFixed { size, got: self }.into())
                 }
             }
-            other => Err(Details::GetStringForFixed(other).into()),
+            other => Err(Details::GetFixed { size, got: self }.into()),
         }
     }
 
@@ -1024,6 +1032,7 @@ impl Value {
         enclosing_namespace: &Namespace,
         field_default: &Option<JsonValue>,
     ) -> Result<Self, Error> {
+        // TODO: How does this deal with an union in an union?
         let v = match self {
             // Both are unions case.
             Value::Union(_i, v) => *v,
@@ -1049,6 +1058,7 @@ impl Value {
         names: &HashMap<Name, S>,
         enclosing_namespace: &Namespace,
     ) -> Result<Self, Error> {
+        // TODO: We could allow Value::Map if items == (Value::String, Value)
         match self {
             Value::Array(items) => Ok(Value::Array(
                 items
@@ -1070,6 +1080,7 @@ impl Value {
         names: &HashMap<Name, S>,
         enclosing_namespace: &Namespace,
     ) -> Result<Self, Error> {
+        // TODO: We could allow Value::Array((Value::String, Value))
         match self {
             Value::Map(items) => Ok(Value::Map(
                 items
@@ -1098,6 +1109,7 @@ impl Value {
         let mut items = match self {
             Value::Map(items) => Ok(items),
             Value::Record(fields) => Ok(fields.into_iter().collect::<HashMap<_, _>>()),
+            // TODO: Allow Value::Array((Value::String, Value)) too?
             other => Err(Error::new(Details::GetRecord {
                 expected: fields
                     .iter()
@@ -1157,14 +1169,15 @@ impl Value {
     }
 
     fn try_u8(self) -> AvroResult<u8> {
-        let int = self.resolve(&Schema::Int)?;
-        if let Value::Int(n) = int {
-            if n >= 0 && n <= i32::from(u8::MAX) {
-                return Ok(n as u8);
-            }
+        let Value::Int(n) = self.resolve_int()? else {
+            // Calling resolve_int can only return a Value::Int or an error
+            unreachable!();
+        };
+        if n >= 0 && n <= i32::from(u8::MAX) {
+            Ok(n as u8)
+        } else {
+            Err(Details::GetU8(n).into())
         }
-
-        Err(Details::GetU8(int).into())
     }
 }
 

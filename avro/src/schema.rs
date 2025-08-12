@@ -999,15 +999,11 @@ pub(crate) type Scale = DecimalMetadata;
 
 fn parse_json_integer_for_decimal(value: &serde_json::Number) -> Result<DecimalMetadata, Error> {
     Ok(if value.is_u64() {
-        let num = value
-            .as_u64()
-            .ok_or_else(|| Details::GetU64FromJson(value.clone()))?;
+        let num = value.as_u64().expect("Unreachable! Guaranteed by is_u64");
         num.try_into()
             .map_err(|e| Details::ConvertU64ToUsize(e, num))?
     } else if value.is_i64() {
-        let num = value
-            .as_i64()
-            .ok_or_else(|| Details::GetI64FromJson(value.clone()))?;
+        let num = value.as_i64().expect("Unreachable! Guaranteed by is_i64");
         num.try_into()
             .map_err(|e| Details::ConvertI64ToUsize(e, num))?
     } else {
@@ -1430,9 +1426,9 @@ impl Parser {
 
         let value = self
             .input_schemas
+            // TODO: Should this remove the value?
             .remove(&fully_qualified_name)
-            // TODO make a better descriptive error message here that conveys that a named schema cannot be found
-            .ok_or_else(|| Details::ParsePrimitive(fully_qualified_name.fullname(None)))?;
+            .ok_or_else(|| Details::FindNamedSchema(fully_qualified_name.fullname(None)))?;
 
         // parsing a full schema from inside another schema. Other full schema will not inherit namespace
         let parsed = self.parse(&value, &None)?;
@@ -1455,7 +1451,7 @@ impl Parser {
                     if key == "scale" {
                         Ok(0)
                     } else {
-                        Err(Details::GetDecimalMetadataFromJson(key).into())
+                        Err(Details::GetDecimalMetadataFromJson.into())
                     }
                 }
                 Some(value) => Err(Details::GetDecimalMetadataValueFromJson {

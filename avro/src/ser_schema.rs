@@ -333,6 +333,7 @@ impl<W: Write> ser::SerializeStruct for SchemaAwareWriteSerializeStruct<'_, '_, 
                     self.ser.enclosing_namespace.clone(),
                 ))?;
         } else {
+            // TODO: Should this be an error? If the field is skipped then it's fine it's not in the record right?
             return Err(Details::GetField(key.to_string()).into());
         }
 

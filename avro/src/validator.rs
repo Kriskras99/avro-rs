@@ -135,7 +135,7 @@ pub(crate) fn validate_namespace(ns: &str) -> AvroResult<()> {
 }
 
 /// A trait that validates enum symbol names.
-/// To register a custom one use [set_enum_symbol_name_validator].
+/// To register a custom one use [`set_enum_symbol_name_validator`].
 pub trait EnumSymbolNameValidator: Send + Sync {
     /// Returns the regex used to validate the symbols of enum schema
     /// according to the Avro specification.
@@ -167,6 +167,8 @@ static ENUM_SYMBOL_NAME_VALIDATOR_ONCE: OnceLock<Box<dyn EnumSymbolNameValidator
 ///
 /// Returns a unit if the registration was successful or the already
 /// registered validator if the registration failed.
+///
+/// The default is the regex `^[A-Za-z_][A-Za-z0-9_]*$`,
 ///
 /// **Note**: This function must be called before parsing any schema because this will
 /// register the default validator and the registration is one time only!
