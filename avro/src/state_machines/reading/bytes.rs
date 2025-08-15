@@ -61,6 +61,7 @@ impl StateMachine for BytesStateMachine {
         // How much of that is available in the buffer
         let available = remaining.min(buffer.available_data());
         self.data.extend_from_slice(&buffer.data()[..available]);
+        buffer.consume(available);
         if remaining - available == 0 {
             Ok(StateMachineControlFlow::Done(self.data))
         } else {

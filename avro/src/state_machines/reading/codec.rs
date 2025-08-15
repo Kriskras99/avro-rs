@@ -3,7 +3,6 @@ use crate::{
     state_machines::reading::{StateMachine, StateMachineControlFlow, StateMachineResult},
 };
 use oval::Buffer;
-use crate::error::Details;
 
 pub struct CodecStateMachine<T: StateMachine> {
     sub_machine: Option<T>,
@@ -103,7 +102,7 @@ impl<T: StateMachine> StateMachine for CodecStateMachine<T> {
                 } = inflate(decoder, buffer.data(), self.buffer.space(), MZFlush::None);
                 status.unwrap();
                 buffer.consume(bytes_consumed);
-                buffer.fill(bytes_written);
+                self.buffer.fill(bytes_written);
 
                 &mut self.buffer
             }
@@ -118,7 +117,9 @@ impl<T: StateMachine> StateMachine for CodecStateMachine<T> {
                     bytes_read,
                     bytes_written,
                     ..
-                } = decoder.run_on_buffers(buffer.data(), self.buffer.space()).map_err(Details::ZstdDecompress)?;
+                } = decoder
+                    .run_on_buffers(buffer.data(), self.buffer.space())
+                    .map_err(crate::error::Details::ZstdDecompress)?;
                 buffer.consume(bytes_read);
                 self.buffer.fill(bytes_written);
 

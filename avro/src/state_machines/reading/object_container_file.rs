@@ -1,15 +1,16 @@
-use log::warn;
-use oval::Buffer;
-use std::{collections::HashMap, io::Read, str::FromStr, sync::Arc};
-
 use crate::{
     Codec, Error, Schema,
     error::Details,
+    schema::{Names, NamesRef},
     state_machines::reading::{
         CommandTape, ItemRead, StateMachine, StateMachineControlFlow, StateMachineResult,
         codec::CodecStateMachine, decode_zigzag_buffer, object::ObjectStateMachine,
     },
 };
+use log::warn;
+use oval::Buffer;
+use serde_json::Value;
+use std::{collections::HashMap, io::Read, str::FromStr, sync::Arc};
 
 // TODO: Dynamically/const construct this, this one works only on 64-bit LE
 /// The tape corresponding to [`HEADER_JSON`].
@@ -32,6 +33,7 @@ const HEADER_TAPE: &[u8] = &[
     CommandTape::FIXED,                             // After the map there is a Fixed amount of bytes
     0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // The amount of bytes is 0x0F
 ];
+#[cfg(test)]
 const HEADER_JSON: &str = r#"{"type": "record","name": "org.apache.avro.file.HeaderNoMagic","fields": [{"name": "meta", "type": {"type": "map", "values": "bytes"}},{"name": "sync", "type": {"type": "fixed", "name": "Sync", "size": 16}}]}"#;
 
 /// The header as read from an Object Container file format.
@@ -39,24 +41,11 @@ pub struct ObjectContainerFileHeader {
     /// The schema used to write the file.
     pub schema: Schema,
     /// The compression used.
-    // TODO: Add decompression
     pub codec: Codec,
     /// The sync marker used between blocks
     pub sync: [u8; 16],
     /// User metadata in the header
-    pub metadata: HashMap<Box<str>, Box<[u8]>>,
-}
-
-/// A state machine for parsing the header of the Object Container file format.
-///
-/// After finishing this state machine the body can be read with [`ObjectContainerFileBodyStateMachine`].
-pub struct ObjectContainerFileHeaderStateMachine {
-    /// The actual state machine used to parse the header.
-    ///
-    /// This doesn't actually need to be an [`Option`] as it's constructed in [`Self::new`]. However,
-    /// as [`StateMachine::parse`] takes `self` we need it in an `Option` so we can do [`Option::take`].
-    fsm: Option<ObjectStateMachine>,
-    read_magic: bool,
+    pub metadata: HashMap<String, Vec<u8>>,
 }
 
 impl ObjectContainerFileHeader {
@@ -68,7 +57,13 @@ impl ObjectContainerFileHeader {
     ///
     /// # Panics
     /// Will panic if the tape was not produced from [`Self::command_tape()`].
-    pub fn from_tape(mut tape: Vec<ItemRead>) -> Result<Self, Error> {
+    pub fn from_tape(mut tape: Vec<ItemRead>, names: &NamesRef) -> Result<Self, Error> {
+        // TODO: Make parse_with_names accept NamesRef
+        let names: Names = names
+            .iter()
+            .map(|(key, &value)| (key.clone(), value.clone()))
+            .collect();
+
         // We want to read the tape from front to back
         let mut tape = tape.drain(..);
 
@@ -82,46 +77,50 @@ impl ObjectContainerFileHeader {
                 // Got to the end of the map
                 break;
             }
-            let Some(ItemRead::String(key)) = tape.next() else {
-                panic!("The input does not correspond to the command tape");
-            };
-            let Some(ItemRead::Bytes(value)) = tape.next() else {
-                panic!("The input does not correspond to the command tape");
-            };
+            for _ in 0..items_left {
+                let Some(ItemRead::String(key)) = tape.next() else {
+                    panic!("The input does not correspond to the command tape");
+                };
+                let Some(ItemRead::Bytes(value)) = tape.next() else {
+                    panic!("The input does not correspond to the command tape");
+                };
 
-            match key.as_ref() {
-                "avro.schema" => {
-                    let string = String::from_utf8(value.into()).map_err(Details::ConvertToUtf8)?;
-                    let parsed_schema = Schema::parse_str(&string)?;
-                    if schema.replace(parsed_schema).is_some() {
-                        // Duplicate key
-                        return Err(Details::GetHeaderMetadata.into());
+                match key.as_ref() {
+                    "avro.schema" => {
+                        if schema.is_some() {
+                            // Duplicate key
+                            return Err(Details::GetHeaderMetadata.into());
+                        }
+                        let json: Value =
+                            serde_json::from_slice(&value).map_err(Details::ParseSchemaJson)?;
+                        let parsed_schema = Schema::parse_with_names(&json, names.clone())?;
+                        schema.replace(parsed_schema);
                     }
-                }
-                "avro.codec" => {
-                    let string = String::from_utf8(value.into()).map_err(Details::ConvertToUtf8)?;
-                    let parsed_codec =
-                        Codec::from_str(&string).map_err(|_| Details::CodecNotSupported(string))?;
-                    if codec.replace(parsed_codec).is_some() {
-                        // Duplicate key
-                        return Err(Details::GetHeaderMetadata.into());
+                    "avro.codec" => {
+                        let string = String::from_utf8(value).map_err(Details::ConvertToUtf8)?;
+                        let parsed_codec = Codec::from_str(&string)
+                            .map_err(|_| Details::CodecNotSupported(string))?;
+                        if codec.replace(parsed_codec).is_some() {
+                            // Duplicate key
+                            return Err(Details::GetHeaderMetadata.into());
+                        }
                     }
-                }
-                "avro.codec.compression_level" => {
-                    // Compression level is not useful for decoding
-                    if found_compression_level {
-                        // Duplicate key
-                        return Err(Details::GetHeaderMetadata.into());
+                    "avro.codec.compression_level" => {
+                        // Compression level is not useful for decoding
+                        if found_compression_level {
+                            // Duplicate key
+                            return Err(Details::GetHeaderMetadata.into());
+                        }
+                        found_compression_level = true;
                     }
-                    found_compression_level = true;
-                }
-                _ => {
-                    if key.starts_with("avro.") {
-                        warn!("Ignoring unknown metadata key: {key}");
-                    }
-                    if metadata.insert(key, value).is_some() {
-                        // Duplicate key
-                        return Err(Details::GetHeaderMetadata.into());
+                    _ => {
+                        if key.starts_with("avro.") {
+                            warn!("Ignoring unknown metadata key: {key}");
+                        }
+                        if metadata.insert(key, value).is_some() {
+                            // Duplicate key
+                            return Err(Details::GetHeaderMetadata.into());
+                        }
                     }
                 }
             }
@@ -130,11 +129,11 @@ impl ObjectContainerFileHeader {
             return Err(Details::GetHeaderMetadata.into());
         };
         let codec = codec.unwrap_or(Codec::Null);
-        let Some(ItemRead::Fixed(raw_sync)) = tape.next() else {
+        let Some(ItemRead::Bytes(raw_sync)) = tape.next() else {
             panic!("The input does not correspond to the command tape");
         };
         let sync = raw_sync
-            .as_ref()
+            .as_slice()
             .try_into()
             .expect("The input does not correspond to the command tape");
         Ok(ObjectContainerFileHeader {
@@ -146,18 +145,31 @@ impl ObjectContainerFileHeader {
     }
 }
 
-impl ObjectContainerFileHeaderStateMachine {
-    pub fn new() -> Self {
+/// A state machine for parsing the header of the Object Container file format.
+///
+/// After finishing this state machine the body can be read with [`ObjectContainerFileBodyStateMachine`].
+pub struct ObjectContainerFileHeaderStateMachine<'n> {
+    /// The actual state machine used to parse the header.
+    ///
+    /// This doesn't actually need to be an [`Option`] as it's constructed in [`Self::new`]. However,
+    /// as [`StateMachine::parse`] takes `self` we need it in an `Option` so we can do [`Option::take`].
+    fsm: Option<ObjectStateMachine>,
+    read_magic: bool,
+    names: &'n NamesRef<'n>,
+}
+
+impl<'n> ObjectContainerFileHeaderStateMachine<'n> {
+    pub fn new(names: &'n NamesRef<'n>) -> Self {
+        let commands = CommandTape::new(Arc::from(HEADER_TAPE));
         Self {
-            fsm: Some(ObjectStateMachine::new(CommandTape::new(Arc::from(
-                HEADER_TAPE,
-            )))),
+            fsm: Some(ObjectStateMachine::new(commands)),
             read_magic: false,
+            names,
         }
     }
 }
 
-impl StateMachine for ObjectContainerFileHeaderStateMachine {
+impl StateMachine for ObjectContainerFileHeaderStateMachine<'_> {
     type Output = ObjectContainerFileHeader;
 
     fn parse(mut self, buffer: &mut Buffer) -> StateMachineResult<Self, Self::Output> {
@@ -165,7 +177,7 @@ impl StateMachine for ObjectContainerFileHeaderStateMachine {
             if buffer.available_data() < 4 {
                 return Ok(StateMachineControlFlow::NeedMore(self));
             }
-            if &buffer.data()[0..4] != b"Obj1" {
+            if buffer.data()[0..4] != [b'O', b'b', b'j', 1] {
                 return Err(Details::HeaderMagic.into());
             }
             buffer.consume(4);
@@ -177,7 +189,7 @@ impl StateMachine for ObjectContainerFileHeaderStateMachine {
                 Ok(StateMachineControlFlow::NeedMore(self))
             }
             StateMachineControlFlow::Done(tape) => Ok(StateMachineControlFlow::Done(
-                ObjectContainerFileHeader::from_tape(tape)?,
+                ObjectContainerFileHeader::from_tape(tape, self.names)?,
             )),
         }
     }
@@ -250,7 +262,7 @@ impl StateMachine for ObjectContainerFileBodyStateMachine {
                 return Ok(StateMachineControlFlow::NeedMore(self));
             };
             // Make sure the value is sane
-            let _ = usize::try_from(block).map_err(|e| Details::ConvertI64ToUsize(e, block))?;
+            let _size = usize::try_from(block).map_err(|e| Details::ConvertI64ToUsize(e, block))?;
             self.need_to_read_block_byte_size = false;
         }
 
@@ -271,7 +283,7 @@ impl StateMachine for ObjectContainerFileBodyStateMachine {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     use crate::{
         Schema,
@@ -284,7 +296,7 @@ mod tests {
     #[test]
     pub fn header_tape() {
         let schema = Schema::parse_str(HEADER_JSON).unwrap();
-        let tape = CommandTape::build_from_schema(&schema).unwrap();
+        let tape = CommandTape::build_from_schema(&schema, &HashMap::new()).unwrap();
         assert_eq!(tape, CommandTape::new(Arc::from(HEADER_TAPE)));
     }
 }

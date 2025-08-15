@@ -1,30 +1,33 @@
-use std::ops::DerefMut as _;
-
 use oval::Buffer;
 
 use crate::{
     Error,
     error::Details,
     state_machines::reading::{
-        CommandTape, ItemRead, StateMachine, StateMachineControlFlow, SubStateMachine,
-        decode_zigzag_buffer, object::ObjectStateMachine, replace_drop,
+        CommandTape, ItemRead, StateMachine, StateMachineControlFlow, decode_zigzag_buffer,
+        object::ObjectStateMachine,
     },
 };
 
+/// Are we currently parsing an object or just finished/reading a block header
+enum TapeOrFsm {
+    Tape(Vec<ItemRead>),
+    Fsm(ObjectStateMachine),
+}
+
 pub struct BlockStateMachine {
     command_tape: CommandTape,
-    current_sub_machine: Box<SubStateMachine>,
-    tape: Vec<ItemRead>,
+    tape_or_fsm: TapeOrFsm,
     left_in_current_block: usize,
     need_to_read_block_byte_size: bool,
 }
 
 impl BlockStateMachine {
-    pub fn new(command_tape: CommandTape, tape: Vec<ItemRead>) -> Self {
+    pub fn new_with_tape(command_tape: CommandTape, tape: Vec<ItemRead>) -> Self {
         Self {
+            // This clone is *cheap*
             command_tape,
-            current_sub_machine: Box::new(SubStateMachine::None),
-            tape,
+            tape_or_fsm: TapeOrFsm::Tape(tape),
             left_in_current_block: 0,
             need_to_read_block_byte_size: false,
         }
@@ -38,70 +41,69 @@ impl StateMachine for BlockStateMachine {
         buffer: &mut Buffer,
     ) -> Result<StateMachineControlFlow<Self, Self::Output>, Error> {
         loop {
-            // If we finished the last block (or are newly created) read the block info
-            if self.left_in_current_block == 0 {
-                let Some(block) = decode_zigzag_buffer(buffer)? else {
-                    // Not enough data left in the buffer
-                    return Ok(StateMachineControlFlow::NeedMore(self));
-                };
-                self.need_to_read_block_byte_size = block.is_negative();
-                let abs_block = block.unsigned_abs();
-                let abs_block = usize::try_from(abs_block)
-                    .map_err(|e| Details::ConvertU64ToUsize(e, abs_block))?;
-                self.tape.push(ItemRead::Block(abs_block));
-                if abs_block == 0 {
-                    // Done parsing the array
-                    return Ok(StateMachineControlFlow::Done(self.tape));
-                }
-            }
-            // If the block length was negative we need to read the block size
-            if self.need_to_read_block_byte_size {
-                let Some(block) = decode_zigzag_buffer(buffer)? else {
-                    // Not enough data left in the buffer
-                    return Ok(StateMachineControlFlow::NeedMore(self));
-                };
-                // Make sure the value is sane
-                let _ = usize::try_from(block).map_err(|e| Details::ConvertI64ToUsize(e, block))?;
-                self.need_to_read_block_byte_size = false;
-            }
+            match self.tape_or_fsm {
+                TapeOrFsm::Tape(mut tape) => {
+                    // If we finished the last block (or are newly created) read the block info
+                    if self.left_in_current_block == 0 {
+                        let Some(block) = decode_zigzag_buffer(buffer)? else {
+                            // Not enough data left in the buffer
+                            self.tape_or_fsm = TapeOrFsm::Tape(tape);
+                            return Ok(StateMachineControlFlow::NeedMore(self));
+                        };
 
-            // Either run the existing state machine or create a new one and run that
-            match std::mem::take(self.current_sub_machine.deref_mut()) {
-                SubStateMachine::None => {
-                    let fsm = ObjectStateMachine::new_with_tape(
+                        // Need to read the block byte size when block is negative
+                        self.need_to_read_block_byte_size = block.is_negative();
+
+                        // We do the rest with the absolute block size
+                        let abs_block = usize::try_from(block.unsigned_abs())
+                            .map_err(|e| Details::ConvertU64ToUsize(e, block.unsigned_abs()))?;
+                        self.left_in_current_block = abs_block;
+                        tape.push(ItemRead::Block(abs_block));
+
+                        // Done parsing the blocks
+                        if abs_block == 0 {
+                            return Ok(StateMachineControlFlow::Done(tape));
+                        }
+                    }
+
+                    // If the block length was negative we need to read the block size
+                    if self.need_to_read_block_byte_size {
+                        let Some(block) = decode_zigzag_buffer(buffer)? else {
+                            // Not enough data left in the buffer
+                            self.tape_or_fsm = TapeOrFsm::Tape(tape);
+                            return Ok(StateMachineControlFlow::NeedMore(self));
+                        };
+
+                        // Make sure the value is sane
+                        // TODO: Maybe use safe_len here?
+                        let _ = usize::try_from(block)
+                            .map_err(|e| Details::ConvertI64ToUsize(e, block))?;
+
+                        // This is not necessary, as it will be overwritten before being read again
+                        // but it does show the intent more clearly
+                        self.need_to_read_block_byte_size = false;
+                    }
+
+                    // We've either finished reading the block header or the last object was read and
+                    // left_in_current_block is not zero
+                    self.tape_or_fsm = TapeOrFsm::Fsm(ObjectStateMachine::new_with_tape(
                         self.command_tape.clone(),
-                        std::mem::take(&mut self.tape),
-                    );
-                    // Optimistically run the state machine
+                        tape,
+                    ))
+                }
+                TapeOrFsm::Fsm(fsm) => {
+                    // (Continue) reading the object
                     match fsm.parse(buffer)? {
                         StateMachineControlFlow::NeedMore(fsm) => {
-                            replace_drop(
-                                self.current_sub_machine.deref_mut(),
-                                SubStateMachine::Object(fsm),
-                            );
+                            self.tape_or_fsm = TapeOrFsm::Fsm(fsm);
                             return Ok(StateMachineControlFlow::NeedMore(self));
                         }
                         StateMachineControlFlow::Done(tape) => {
-                            self.tape = tape;
+                            self.tape_or_fsm = TapeOrFsm::Tape(tape);
                             self.left_in_current_block -= 1;
                         }
                     }
                 }
-                SubStateMachine::Object(fsm) => match fsm.parse(buffer)? {
-                    StateMachineControlFlow::NeedMore(fsm) => {
-                        replace_drop(
-                            self.current_sub_machine.deref_mut(),
-                            SubStateMachine::Object(fsm),
-                        );
-                        return Ok(StateMachineControlFlow::NeedMore(self));
-                    }
-                    StateMachineControlFlow::Done(tape) => {
-                        self.tape = tape;
-                        replace_drop(self.current_sub_machine.deref_mut(), SubStateMachine::None);
-                        self.left_in_current_block -= 1;
-                    }
-                },
-                _ => unreachable!(),
             }
         }
     }

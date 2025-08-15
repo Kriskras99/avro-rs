@@ -2,8 +2,12 @@ use crate::{
     Error, Schema,
     error::Details,
     schema::{
-        ArraySchema, DecimalSchema, EnumSchema, FixedSchema, MapSchema, Name, RecordSchema,
-        UnionSchema,
+        ArraySchema, DecimalSchema, EnumSchema, FixedSchema, MapSchema, Name, NamesRef,
+        RecordSchema, UnionSchema,
+    },
+    state_machines::reading::{
+        ItemRead, SubStateMachine, block::BlockStateMachine, bytes::BytesStateMachine,
+        object::ObjectStateMachine, union::UnionStateMachine,
     },
 };
 use std::{collections::HashMap, ops::Range, sync::Arc};
@@ -23,35 +27,77 @@ pub enum ToRead {
     Ref(CommandTape),
     Fixed(usize),
     Block(CommandTape),
-    Union(UnionVariants),
+    Union {
+        variants: CommandTape,
+        num_variants: usize,
+    },
 }
 
-pub struct UnionVariants {
-    tape: CommandTape,
-    num_variants: usize,
-}
-
-impl UnionVariants {
-    pub fn get(mut self, index: usize) -> Result<CommandTape, Error> {
-        if index >= self.num_variants {
-            return Err(Details::GetUnionVariant {
-                index: index as i64,
-                num_variants: self.num_variants,
+impl ToRead {
+    pub fn into_state_machine(self, read: Vec<ItemRead>) -> SubStateMachine {
+        match self {
+            ToRead::Null => SubStateMachine::Null(read),
+            ToRead::Boolean => SubStateMachine::Bool(read),
+            ToRead::Int => SubStateMachine::Int(read),
+            ToRead::Long => SubStateMachine::Long(read),
+            ToRead::Float => SubStateMachine::Float(read),
+            ToRead::Double => SubStateMachine::Double(read),
+            ToRead::Enum => SubStateMachine::Enum(read),
+            ToRead::Bytes => SubStateMachine::Bytes {
+                fsm: BytesStateMachine::new(),
+                read,
+            },
+            ToRead::String => SubStateMachine::String {
+                fsm: BytesStateMachine::new(),
+                read,
+            },
+            ToRead::Fixed(length) => SubStateMachine::Bytes {
+                fsm: BytesStateMachine::new_with_length(length),
+                read,
+            },
+            ToRead::Ref(commands) => {
+                SubStateMachine::Object(ObjectStateMachine::new_with_tape(commands, read))
             }
-            .into());
+            ToRead::Block(commands) => {
+                SubStateMachine::Block(BlockStateMachine::new_with_tape(commands, read))
+            }
+            ToRead::Union {
+                variants,
+                num_variants,
+            } => SubStateMachine::Union(UnionStateMachine::new_with_tape(
+                variants,
+                num_variants,
+                read,
+            )),
         }
-        // Skip past the other variants
-        self.tape.skip(index);
-        let offset = self.tape.read_range.next().expect("Unreachable!");
-        // Return the next command as the command tape
-        Ok(self.tape.extract(offset, 1))
+    }
+}
+
+impl std::fmt::Debug for ToRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Null => write!(f, "Null"),
+            Self::Boolean => write!(f, "Boolean"),
+            Self::Int => write!(f, "Int"),
+            Self::Long => write!(f, "Long"),
+            Self::Float => write!(f, "Float"),
+            Self::Double => write!(f, "Double"),
+            Self::Bytes => write!(f, "Bytes"),
+            Self::String => write!(f, "String"),
+            Self::Enum => write!(f, "Enum"),
+            // We don't show the Ref command as that could recurse forever
+            Self::Ref(_) => write!(f, "Ref<...>"),
+            Self::Fixed(arg0) => write!(f, "Fixed<{arg0}>"),
+            Self::Block(arg0) => f.debug_tuple("Block").field(arg0).finish(),
+            Self::Union { variants, .. } => f.debug_tuple("Union").field(variants).finish(),
+        }
     }
 }
 
 /// A section of a tape of commands.
 ///
 /// This has a reference to the entire tape, so that references to types (for Union,Map,Array) can be resolved.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 #[must_use]
 pub struct CommandTape {
     inner: Arc<[u8]>,
@@ -107,8 +153,8 @@ impl CommandTape {
         }
     }
 
-    pub fn build_from_schema(schema: &Schema) -> Result<Self, Error> {
-        CommandTapeBuilder::build(schema)
+    pub fn build_from_schema(schema: &Schema, names: &NamesRef) -> Result<Self, Error> {
+        CommandTapeBuilder::build(schema, names)
     }
 
     /// Check if the section of the tape we're reading is finished.
@@ -125,15 +171,15 @@ impl CommandTape {
             read_range: offset..self.inner.len(),
         };
         temp.skip(commands);
-        let size = temp.read_range.next().unwrap_or(self.inner.len());
+        let max_index = temp.read_range.next().unwrap_or(self.inner.len());
 
         assert!(
-            offset + size <= self.inner.len(),
+            max_index <= self.inner.len(),
             "Reference is (partly) outside the tape"
         );
         Self {
             inner: self.inner.clone(),
-            read_range: offset..(offset + size),
+            read_range: offset..max_index,
         }
     }
 
@@ -151,8 +197,17 @@ impl CommandTape {
     /// Read an array of bytes from the tape.
     fn read_array<const N: usize>(&mut self) -> [u8; N] {
         let start = self.read_range.next().expect("Read past the limit");
-        let end = self.read_range.nth(N - 1).expect("Read past the limit");
+        let end = self.read_range.nth(N - 2).expect("Read past the limit");
         self.inner[start..=end].try_into().expect("Unreachable!")
+    }
+
+    fn read_inline_or(&mut self, byte: u8) -> usize {
+        if byte >> 4 != 0 {
+            // Length is stored inline
+            (byte >> 4) as usize
+        } else {
+            usize::from_ne_bytes(self.read_array())
+        }
     }
 
     /// Get the next command from the tape.
@@ -171,16 +226,7 @@ impl CommandTape {
                 Self::BYTES => Some(ToRead::Bytes),
                 Self::STRING => Some(ToRead::String),
                 Self::ENUM => Some(ToRead::Enum),
-                Self::FIXED => {
-                    // ToRead::Fixed
-                    if byte >> 4 != 0 {
-                        // Length is stored inline
-                        Some(ToRead::Fixed((byte >> 4) as usize))
-                    } else {
-                        let length = usize::from_ne_bytes(self.read_array());
-                        Some(ToRead::Fixed(length))
-                    }
-                }
+                Self::FIXED => Some(ToRead::Fixed(self.read_inline_or(byte))),
                 Self::BLOCK => {
                     // ToRead::Block
                     let size = (byte >> 4) as usize;
@@ -188,44 +234,36 @@ impl CommandTape {
                     Some(ToRead::Block(self.extract(position + 1, size)))
                 }
                 Self::UNION => {
-                    // ToRead::Union
                     // How many variants are there?
-                    let num_variants = if byte >> 4 != 0 {
-                        (byte >> 4) as usize
-                    } else {
-                        // TODO: Use varint
-                        let num_variants = u32::from_ne_bytes(self.read_array());
-                        num_variants as usize
-                    };
-                    let variants = UnionVariants {
-                        tape: self.clone(),
-                        num_variants,
-                    };
+                    let num_variants = self.read_inline_or(byte);
 
-                    // Skip over the commands for the variants
+                    // Skip over the union variants while keeping track of their start and end
+                    // so we can easily create the command tape
+                    let start = self.read_range.start;
                     self.skip(num_variants);
+                    let end = self.read_range.start;
 
-                    Some(ToRead::Union(variants))
+                    // Create the command tape from the previously tracked start and end
+                    let mut tape = self.clone();
+                    tape.read_range.start = start;
+                    tape.read_range.end = end;
+
+                    Some(ToRead::Union {
+                        variants: tape,
+                        num_variants,
+                    })
                 }
                 Self::REF => {
-                    // ToRead::Ref
-                    let size = if byte >> 4 != 0 {
-                        // Length is stored inline
-                        (byte >> 4) as usize
-                    } else {
-                        usize::from_ne_bytes(self.read_array())
-                    };
+                    let size = self.read_inline_or(byte);
                     let offset = usize::from_ne_bytes(self.read_array());
                     Some(ToRead::Ref(self.extract(offset, size)))
                 }
                 Self::SKIP => {
-                    let commands = if byte >> 4 != 0 {
-                        (byte >> 4) as usize
-                    } else {
-                        usize::from_ne_bytes(self.read_array())
-                    };
+                    // Read how many commands to skip and skip them
+                    let commands = self.read_inline_or(byte);
                     self.skip(commands);
 
+                    // Return the next command
                     self.command()
                 }
                 _ => unreachable!(), // TODO: There is room here to specialize certain types, like a Union of Null and some other type
@@ -238,21 +276,15 @@ impl CommandTape {
     /// Skip `amount` commands.
     ///
     /// If a command contains subcommands, these will also be skipped.
-    fn skip(&mut self, mut amount: usize) {
+    ///
+    /// # Returns
+    /// `None` if it read past the end of the tape
+    pub(crate) fn skip(&mut self, mut amount: usize) -> Option<()> {
         let mut i = 0;
         while i < amount {
-            let position = self
-                .read_range
-                .next()
-                .expect("The caller read past the tape");
+            let position = self.read_range.next()?;
             let byte = self.inner[position];
             match byte & 0xF {
-                CommandTape::REF => {
-                    if byte >> 4 == 0 {
-                        let _size = usize::from_ne_bytes(self.read_array());
-                    }
-                    let _offset = usize::from_ne_bytes(self.read_array());
-                }
                 CommandTape::BOOLEAN
                 | CommandTape::INT
                 | CommandTape::LONG
@@ -263,38 +295,56 @@ impl CommandTape {
                 | CommandTape::ENUM
                 | CommandTape::NULL => {}
                 CommandTape::FIXED => {
-                    if byte >> 4 == 0 {
-                        let _size = usize::from_ne_bytes(self.read_array());
-                    }
+                    let _size = self.read_inline_or(byte);
+                }
+                CommandTape::REF => {
+                    let _size = self.read_inline_or(byte);
+                    let _offset = usize::from_ne_bytes(self.read_array());
                 }
                 CommandTape::UNION | CommandTape::BLOCK | CommandTape::SKIP => {
                     // These commands can inline other commands, so add them to the skip list
-                    let num_variants = if byte >> 4 != 0 {
-                        (byte >> 4) as usize
-                    } else {
-                        // TODO: Use varint
-                        let num_variants = u32::from_ne_bytes(self.read_array());
-                        num_variants as usize
-                    };
+                    let num_variants = self.read_inline_or(byte);
                     amount += num_variants;
+
+                    // Skip does not count as a command, but we do increment `i` so we compensate
+                    // for that by incrementing the amount
+                    if byte & 0xF == CommandTape::SKIP {
+                        amount += 1;
+                    }
                 }
                 _ => unreachable!(),
             }
             i += 1;
         }
+        Some(())
+    }
+}
+
+impl std::fmt::Debug for CommandTape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut c = self.clone();
+
+        write!(f, "CommandTape: ")?;
+        let mut list = f.debug_list();
+        while let Some(command) = c.command() {
+            list.entry(&command);
+        }
+        list.finish()
     }
 }
 
 struct CommandTapeBuilder<'a> {
     tape: Vec<u8>,
     references: HashMap<&'a Name, (usize, usize)>,
+    names: &'a NamesRef<'a>,
 }
 
 impl<'a> CommandTapeBuilder<'a> {
-    pub fn new() -> Self {
+    pub fn new(names: &'a NamesRef<'a>) -> Self {
         Self {
             tape: Vec::new(),
             references: HashMap::new(),
+            names,
         }
     }
 
@@ -423,12 +473,14 @@ impl<'a> CommandTapeBuilder<'a> {
                 Ok(1)
             }
             Schema::Ref { name } => {
-                let &(offset, commands) = self
-                    .references
-                    .get(name)
-                    .ok_or_else(|| Details::SchemaResolutionError(name.clone()))?;
-                self.add_reference(offset, commands);
-                Ok(1)
+                if let Some(&(offset, commands)) = self.references.get(name) {
+                    self.add_reference(offset, commands);
+                    Ok(1)
+                } else if let Some(schema) = self.names.get(name).copied() {
+                    self.add_schema(schema, inline_up_to)
+                } else {
+                    Err(Details::SchemaResolutionError(name.clone()).into())
+                }
             }
         }
     }
@@ -445,8 +497,8 @@ impl<'a> CommandTapeBuilder<'a> {
         self.tape.extend_from_slice(&offset.to_ne_bytes());
     }
 
-    pub fn build(schema: &Schema) -> Result<CommandTape, Error> {
-        let mut builder = Self::new();
+    pub fn build(schema: &Schema, names: &'a NamesRef<'a>) -> Result<CommandTape, Error> {
+        let mut builder = Self::new(names);
 
         builder.add_schema(schema, usize::MAX)?;
 
@@ -465,126 +517,126 @@ mod tests {
     #[test]
     pub fn command_tape_simple() {
         assert_eq!(
-            CommandTape::build_from_schema(&Schema::Null)
+            CommandTape::build_from_schema(&Schema::Null, &HashMap::new())
                 .unwrap()
                 .inner
                 .as_ref(),
             &[CommandTape::NULL]
         );
         assert_eq!(
-            CommandTape::build_from_schema(&Schema::Boolean)
+            CommandTape::build_from_schema(&Schema::Boolean, &HashMap::new())
                 .unwrap()
                 .inner
                 .as_ref(),
             &[CommandTape::BOOLEAN]
         );
         assert_eq!(
-            CommandTape::build_from_schema(&Schema::Int)
+            CommandTape::build_from_schema(&Schema::Int, &HashMap::new())
                 .unwrap()
                 .inner
                 .as_ref(),
             &[CommandTape::INT]
         );
         assert_eq!(
-            CommandTape::build_from_schema(&Schema::Date)
+            CommandTape::build_from_schema(&Schema::Date, &HashMap::new())
                 .unwrap()
                 .inner
                 .as_ref(),
             &[CommandTape::INT]
         );
         assert_eq!(
-            CommandTape::build_from_schema(&Schema::TimeMillis)
+            CommandTape::build_from_schema(&Schema::TimeMillis, &HashMap::new())
                 .unwrap()
                 .inner
                 .as_ref(),
             &[CommandTape::INT]
         );
         assert_eq!(
-            CommandTape::build_from_schema(&Schema::Long)
+            CommandTape::build_from_schema(&Schema::Long, &HashMap::new())
                 .unwrap()
                 .inner
                 .as_ref(),
             &[CommandTape::LONG]
         );
         assert_eq!(
-            CommandTape::build_from_schema(&Schema::TimeMicros)
+            CommandTape::build_from_schema(&Schema::TimeMicros, &HashMap::new())
                 .unwrap()
                 .inner
                 .as_ref(),
             &[CommandTape::LONG]
         );
         assert_eq!(
-            CommandTape::build_from_schema(&Schema::TimestampMillis)
+            CommandTape::build_from_schema(&Schema::TimestampMillis, &HashMap::new())
                 .unwrap()
                 .inner
                 .as_ref(),
             &[CommandTape::LONG]
         );
         assert_eq!(
-            CommandTape::build_from_schema(&Schema::TimestampMicros)
+            CommandTape::build_from_schema(&Schema::TimestampMicros, &HashMap::new())
                 .unwrap()
                 .inner
                 .as_ref(),
             &[CommandTape::LONG]
         );
         assert_eq!(
-            CommandTape::build_from_schema(&Schema::TimestampNanos)
+            CommandTape::build_from_schema(&Schema::TimestampNanos, &HashMap::new())
                 .unwrap()
                 .inner
                 .as_ref(),
             &[CommandTape::LONG]
         );
         assert_eq!(
-            CommandTape::build_from_schema(&Schema::LocalTimestampMillis)
+            CommandTape::build_from_schema(&Schema::LocalTimestampMillis, &HashMap::new())
                 .unwrap()
                 .inner
                 .as_ref(),
             &[CommandTape::LONG]
         );
         assert_eq!(
-            CommandTape::build_from_schema(&Schema::LocalTimestampMicros)
+            CommandTape::build_from_schema(&Schema::LocalTimestampMicros, &HashMap::new())
                 .unwrap()
                 .inner
                 .as_ref(),
             &[CommandTape::LONG]
         );
         assert_eq!(
-            CommandTape::build_from_schema(&Schema::LocalTimestampNanos)
+            CommandTape::build_from_schema(&Schema::LocalTimestampNanos, &HashMap::new())
                 .unwrap()
                 .inner
                 .as_ref(),
             &[CommandTape::LONG]
         );
         assert_eq!(
-            CommandTape::build_from_schema(&Schema::Float)
+            CommandTape::build_from_schema(&Schema::Float, &HashMap::new())
                 .unwrap()
                 .inner
                 .as_ref(),
             &[CommandTape::FLOAT]
         );
         assert_eq!(
-            CommandTape::build_from_schema(&Schema::Double)
+            CommandTape::build_from_schema(&Schema::Double, &HashMap::new())
                 .unwrap()
                 .inner
                 .as_ref(),
             &[CommandTape::DOUBLE]
         );
         assert_eq!(
-            CommandTape::build_from_schema(&Schema::Bytes)
+            CommandTape::build_from_schema(&Schema::Bytes, &HashMap::new())
                 .unwrap()
                 .inner
                 .as_ref(),
             &[CommandTape::BYTES]
         );
         assert_eq!(
-            CommandTape::build_from_schema(&Schema::String)
+            CommandTape::build_from_schema(&Schema::String, &HashMap::new())
                 .unwrap()
                 .inner
                 .as_ref(),
             &[CommandTape::STRING]
         );
         assert_eq!(
-            CommandTape::build_from_schema(&Schema::Uuid)
+            CommandTape::build_from_schema(&Schema::Uuid, &HashMap::new())
                 .unwrap()
                 .inner
                 .as_ref(),

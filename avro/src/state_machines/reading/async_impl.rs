@@ -1,4 +1,4 @@
-use std::pin::Pin;
+use std::{collections::HashMap, pin::Pin};
 
 use async_stream::try_stream;
 use futures::{AsyncRead, AsyncReadExt, Stream};
@@ -8,6 +8,7 @@ use serde::Deserialize;
 use crate::{
     Error, Schema,
     error::Details,
+    schema::{Namespace, ResolvedSchema},
     state_machines::reading::{
         ItemRead, StateMachine, StateMachineControlFlow,
         commands::CommandTape,
@@ -25,6 +26,7 @@ use crate::{
 // But this suffices for the demonstration.
 pub struct ObjectContainerFileReader<'a, R> {
     reader_schema: Option<&'a Schema>,
+    resolved_schemata: ResolvedSchema<'a>,
     header: ObjectContainerFileHeader,
     fsm: Option<ObjectContainerFileBodyStateMachine>,
     reader: Pin<Box<R>>,
@@ -32,15 +34,40 @@ pub struct ObjectContainerFileReader<'a, R> {
 }
 
 impl<'a, R: AsyncRead> ObjectContainerFileReader<'a, R> {
+    pub async fn new(reader: Pin<Box<R>>) -> Result<Self, Error> {
+        Self::new_schemata(reader, Vec::new()).await
+    }
+
+    pub async fn with_schema(schema: &'a Schema, reader: Pin<Box<R>>) -> Result<Self, Error> {
+        let mut new = Self::new_schemata(reader, Vec::new()).await?;
+        new.reader_schema = Some(schema);
+        Ok(new)
+    }
+
+    pub async fn with_schemata(
+        schema: &'a Schema,
+        schemata: Vec<&'a Schema>,
+        reader: Pin<Box<R>>,
+    ) -> Result<Self, Error> {
+        let mut new = Self::new_schemata(reader, schemata).await?;
+        new.reader_schema = Some(schema);
+        Ok(new)
+    }
+
     /// Create a new reader for the Object Container file format.
     ///
     /// This will immediatly start reading the header.
-    pub async fn new(mut reader: Pin<Box<R>>) -> Result<Self, Error> {
+    // TODO: This pin is probably wrong and R should by AsyncRead + Unpin
+    async fn new_schemata(
+        mut reader: Pin<Box<R>>,
+        schemata: Vec<&'a Schema>,
+    ) -> Result<Self, Error> {
         // Read a maximum of 2Kb per read
         let mut buffer = Buffer::with_capacity(2 * 1024);
 
         // Parse the header
-        let mut fsm = ObjectContainerFileHeaderStateMachine::new();
+        let rs = ResolvedSchema::try_from(schemata)?;
+        let mut fsm = ObjectContainerFileHeaderStateMachine::new(rs.get_names());
         let header = loop {
             // Fill the buffer
             let n = reader
@@ -59,10 +86,12 @@ impl<'a, R: AsyncRead> ObjectContainerFileReader<'a, R> {
             }
         };
 
-        let tape = CommandTape::build_from_schema(&header.schema)?;
+        // TODO: Provide actual names
+        let tape = CommandTape::build_from_schema(&header.schema, rs.get_names())?;
 
         Ok(Self {
             reader_schema: None,
+            resolved_schemata: rs,
             fsm: Some(ObjectContainerFileBodyStateMachine::new(
                 tape,
                 header.sync,
@@ -72,6 +101,18 @@ impl<'a, R: AsyncRead> ObjectContainerFileReader<'a, R> {
             reader,
             buffer,
         })
+    }
+
+    pub fn writer_schema(&self) -> &Schema {
+        &self.header.schema
+    }
+
+    pub fn reader_schema(&self) -> Option<&'a Schema> {
+        self.reader_schema
+    }
+
+    pub fn user_metadata(&self) -> &HashMap<String, Vec<u8>> {
+        &self.header.metadata
     }
 
     pub fn header(&self) -> &ObjectContainerFileHeader {
@@ -116,11 +157,14 @@ impl<'a, R: AsyncRead> ObjectContainerFileReader<'a, R> {
     pub async fn stream_serde<'b, T: Deserialize<'b>>(
         &mut self,
     ) -> impl Stream<Item = Result<T, Error>> {
+        assert!(
+            self.reader_schema.is_none(),
+            "Reader schema is not supported with Serde!"
+        );
         try_stream! {
             while let Some(object) = self.next_object().await {
-                let _tape = object?;
-                yield todo!();
-                // yield deserialize_from_tape(&mut tape, self.reader_schema.unwrap_or(&self.header.schema))?;
+                let mut tape = object?;
+                yield deserialize_from_tape(&mut tape, &self.header.schema)?;
             }
         }
     }
@@ -128,9 +172,53 @@ impl<'a, R: AsyncRead> ObjectContainerFileReader<'a, R> {
     pub async fn stream(&mut self) -> impl Stream<Item = Result<Value, Error>> {
         try_stream! {
             while let Some(object) = self.next_object().await {
-                let _tape = object?;
-                yield todo!();
-                // yield value_from_tape(&mut tape, self.reader_schema.unwrap_or(&self.header.schema))?;
+                let mut tape = object?;
+
+                // TODO: There must be a better way than this
+                let rst = ResolvedSchema::new_with_known_schemata(
+                    vec![&self.header.schema],
+                    &Namespace::None,
+                    self.resolved_schemata.get_names(),
+                )
+                .unwrap();
+                let mut names = HashMap::new();
+                names.extend(
+                    rst.get_names()
+                        .iter()
+                        .map(|(key, &value)| (key.clone(), value)),
+                );
+                names.extend(
+                    self.resolved_schemata
+                        .get_names()
+                        .iter()
+                        .map(|(key, &value)| (key.clone(), value)),
+                );
+                let value = value_from_tape(&mut tape, &self.header.schema, &names)?;
+                let resolved = if let Some(schema) = self.reader_schema {
+                    // TODO: There must be a better way than this
+                    let rst = ResolvedSchema::new_with_known_schemata(
+                        vec![&self.header.schema],
+                        &Namespace::None,
+                        self.resolved_schemata.get_names(),
+                    )
+                    .unwrap();
+                    let mut names = HashMap::new();
+                    names.extend(
+                        rst.get_names()
+                            .iter()
+                            .map(|(key, &value)| (key.clone(), value)),
+                    );
+                    names.extend(
+                        self.resolved_schemata
+                            .get_names()
+                            .iter()
+                            .map(|(key, &value)| (key.clone(), value)),
+                    );
+                    value.resolve(schema)?
+                } else {
+                    value
+                };
+                yield resolved;
             }
         }
     }

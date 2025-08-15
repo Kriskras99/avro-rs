@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::{collections::HashMap, io::Read};
 
 use oval::Buffer;
 use serde::Deserialize;
@@ -6,6 +6,7 @@ use serde::Deserialize;
 use crate::{
     Error, Schema,
     error::Details,
+    schema::{Namespace, ResolvedSchema},
     state_machines::reading::{
         ItemRead, StateMachine, StateMachineControlFlow,
         commands::CommandTape,
@@ -21,6 +22,7 @@ use crate::{
 
 pub struct ObjectContainerFileReader<'a, R> {
     reader_schema: Option<&'a Schema>,
+    resolved_schemata: ResolvedSchema<'a>,
     header: ObjectContainerFileHeader,
     fsm: Option<ObjectContainerFileBodyStateMachine>,
     reader: R,
@@ -29,12 +31,33 @@ pub struct ObjectContainerFileReader<'a, R> {
 
 impl<'a, R: Read> ObjectContainerFileReader<'a, R> {
     /// Create a new reader for the Object Container file format.
-    pub fn new(mut reader: R) -> Result<Self, Error> {
+    pub fn new(reader: R) -> Result<Self, Error> {
+        Self::new_schemata(reader, Vec::new())
+    }
+
+    pub fn with_schema(schema: &'a Schema, reader: R) -> Result<Self, Error> {
+        let mut new = Self::new_schemata(reader, Vec::new())?;
+        new.reader_schema = Some(schema);
+        Ok(new)
+    }
+
+    pub fn with_schemata(
+        schema: &'a Schema,
+        schemata: Vec<&'a Schema>,
+        reader: R,
+    ) -> Result<Self, Error> {
+        let mut new = Self::new_schemata(reader, schemata)?;
+        new.reader_schema = Some(schema);
+        Ok(new)
+    }
+
+    fn new_schemata(mut reader: R, schemata: Vec<&'a Schema>) -> Result<Self, Error> {
         // Read a maximum of 2Kb per read
         let mut buffer = Buffer::with_capacity(2 * 1024);
 
         // Parse the header
-        let mut fsm = ObjectContainerFileHeaderStateMachine::new();
+        let rs = ResolvedSchema::try_from(schemata)?;
+        let mut fsm = ObjectContainerFileHeaderStateMachine::new(rs.get_names());
         let header = loop {
             // Fill the buffer
             let n = reader.read(buffer.space()).map_err(Details::ReadHeader)?;
@@ -50,10 +73,11 @@ impl<'a, R: Read> ObjectContainerFileReader<'a, R> {
             }
         };
 
-        let tape = CommandTape::build_from_schema(&header.schema)?;
+        let tape = CommandTape::build_from_schema(&header.schema, rs.get_names())?;
 
         Ok(Self {
             reader_schema: None,
+            resolved_schemata: rs,
             fsm: Some(ObjectContainerFileBodyStateMachine::new(
                 tape,
                 header.sync,
@@ -63,6 +87,18 @@ impl<'a, R: Read> ObjectContainerFileReader<'a, R> {
             reader,
             buffer,
         })
+    }
+
+    pub fn writer_schema(&self) -> &Schema {
+        &self.header.schema
+    }
+
+    pub fn reader_schema(&self) -> Option<&'a Schema> {
+        self.reader_schema
+    }
+
+    pub fn user_metadata(&self) -> &HashMap<String, Vec<u8>> {
+        &self.header.metadata
     }
 
     pub fn header(&self) -> &ObjectContainerFileHeader {
@@ -105,12 +141,12 @@ impl<'a, R: Read> ObjectContainerFileReader<'a, R> {
     }
 
     pub fn next_serde<'b, T: Deserialize<'b>>(&mut self) -> Option<Result<T, Error>> {
-        self.next_object().map(|r| {
-            r.and_then(|_tape| {
-                todo!()
-                // deserialize_from_tape(&mut tape, self.reader_schema.unwrap_or(&self.header.schema), todo!(), todo!())
-            })
-        })
+        assert!(
+            self.reader_schema.is_none(),
+            "Reader schema is not supported with Serde!"
+        );
+        self.next_object()
+            .map(|r| r.and_then(|mut tape| deserialize_from_tape(&mut tape, &self.header.schema)))
     }
 }
 
@@ -119,9 +155,53 @@ impl<R: Read> Iterator for ObjectContainerFileReader<'_, R> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next_object().map(|r| {
-            r.and_then(|_tape| {
-                todo!()
-                // value_from_tape(&mut tape, self.reader_schema.unwrap_or(&self.header.schema), todo!(), todo!())
+            r.and_then(|mut tape| {
+                // TODO: There must be a better way than this
+                let rst = ResolvedSchema::new_with_known_schemata(
+                    vec![&self.header.schema],
+                    &Namespace::None,
+                    self.resolved_schemata.get_names(),
+                )
+                .unwrap();
+                let mut names = HashMap::new();
+                names.extend(
+                    rst.get_names()
+                        .iter()
+                        .map(|(key, &value)| (key.clone(), value)),
+                );
+                names.extend(
+                    self.resolved_schemata
+                        .get_names()
+                        .iter()
+                        .map(|(key, &value)| (key.clone(), value)),
+                );
+                value_from_tape(&mut tape, &self.header.schema, &names)
+            })
+            .and_then(|v| {
+                if let Some(schema) = &self.reader_schema {
+                    // TODO: There must be a better way than this
+                    let rst = ResolvedSchema::new_with_known_schemata(
+                        vec![&self.header.schema],
+                        &Namespace::None,
+                        self.resolved_schemata.get_names(),
+                    )
+                    .unwrap();
+                    let mut names = HashMap::new();
+                    names.extend(
+                        rst.get_names()
+                            .iter()
+                            .map(|(key, &value)| (key.clone(), value)),
+                    );
+                    names.extend(
+                        self.resolved_schemata
+                            .get_names()
+                            .iter()
+                            .map(|(key, &value)| (key.clone(), value)),
+                    );
+                    v.resolve_internal(schema, &names, &Namespace::None, &None)
+                } else {
+                    Ok(v)
+                }
             })
         })
     }
