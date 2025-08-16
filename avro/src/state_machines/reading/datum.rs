@@ -10,13 +10,13 @@ enum TapeOrFsm {
     Fsm(Box<SubStateMachine>),
 }
 
-pub struct ObjectStateMachine {
+pub struct DatumStateMachine {
     command_tape: CommandTape,
     tape_or_fsm: TapeOrFsm,
 }
 
-impl ObjectStateMachine {
-    /// Create a new state machine that reads an object from the commands.
+impl DatumStateMachine {
+    /// Create a new state machine that reads a datum from the commands.
     pub fn new(command_tape: CommandTape) -> Self {
         Self::new_with_tape(command_tape, Vec::new())
     }
@@ -30,7 +30,7 @@ impl ObjectStateMachine {
     }
 }
 
-impl StateMachine for ObjectStateMachine {
+impl StateMachine for DatumStateMachine {
     type Output = Vec<ItemRead>;
 
     fn parse(mut self, buffer: &mut Buffer) -> StateMachineResult<Self, Self::Output> {

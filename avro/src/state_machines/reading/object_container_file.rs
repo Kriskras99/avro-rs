@@ -4,7 +4,7 @@ use crate::{
     schema::{Names, NamesRef},
     state_machines::reading::{
         CommandTape, ItemRead, StateMachine, StateMachineControlFlow, StateMachineResult,
-        codec::CodecStateMachine, decode_zigzag_buffer, object::ObjectStateMachine,
+        codec::CodecStateMachine, datum::DatumStateMachine, decode_zigzag_buffer,
     },
 };
 use log::warn;
@@ -153,7 +153,7 @@ pub struct ObjectContainerFileHeaderStateMachine<'n> {
     ///
     /// This doesn't actually need to be an [`Option`] as it's constructed in [`Self::new`]. However,
     /// as [`StateMachine::parse`] takes `self` we need it in an `Option` so we can do [`Option::take`].
-    fsm: Option<ObjectStateMachine>,
+    fsm: Option<DatumStateMachine>,
     read_magic: bool,
     names: &'n NamesRef<'n>,
 }
@@ -162,7 +162,7 @@ impl<'n> ObjectContainerFileHeaderStateMachine<'n> {
     pub fn new(names: &'n NamesRef<'n>) -> Self {
         let commands = CommandTape::new(Arc::from(HEADER_TAPE));
         Self {
-            fsm: Some(ObjectStateMachine::new(commands)),
+            fsm: Some(DatumStateMachine::new(commands)),
             read_magic: false,
             names,
         }
@@ -196,7 +196,7 @@ impl StateMachine for ObjectContainerFileHeaderStateMachine<'_> {
 }
 
 pub struct ObjectContainerFileBodyStateMachine {
-    fsm: Option<CodecStateMachine<ObjectStateMachine>>,
+    fsm: Option<CodecStateMachine<DatumStateMachine>>,
     tape: CommandTape,
     sync: [u8; 16],
     left_in_block: usize,
@@ -208,7 +208,7 @@ impl ObjectContainerFileBodyStateMachine {
     pub fn new(tape: CommandTape, sync: [u8; 16], codec: Codec) -> Self {
         Self {
             fsm: Some(CodecStateMachine::new(
-                ObjectStateMachine::new(tape.clone()),
+                DatumStateMachine::new(tape.clone()),
                 codec,
             )),
             tape,
@@ -272,7 +272,7 @@ impl StateMachine for ObjectContainerFileBodyStateMachine {
                 Ok(StateMachineControlFlow::NeedMore(self))
             }
             StateMachineControlFlow::Done((result, mut codec)) => {
-                codec.reset(ObjectStateMachine::new(self.tape.clone()));
+                codec.reset(DatumStateMachine::new(self.tape.clone()));
                 self.fsm.replace(codec);
                 self.left_in_block -= 1;
                 Ok(StateMachineControlFlow::Done(Some((result, self))))

@@ -8,7 +8,7 @@ use crate::{
     },
     state_machines::reading::{
         block::BlockStateMachine, bytes::BytesStateMachine, commands::CommandTape,
-        error::ValueFromTapeError, object::ObjectStateMachine, union::UnionStateMachine,
+        datum::DatumStateMachine, error::ValueFromTapeError, union::UnionStateMachine,
     },
     types::Value,
 };
@@ -22,8 +22,8 @@ pub mod block;
 pub mod bytes;
 pub mod codec;
 mod commands;
+pub mod datum;
 pub mod error;
-pub mod object;
 mod object_container_file;
 pub mod sync;
 mod union;
@@ -71,7 +71,7 @@ pub enum SubStateMachine {
         read: Vec<ItemRead>,
     },
     Block(BlockStateMachine),
-    Object(ObjectStateMachine),
+    Object(DatumStateMachine),
     Union(UnionStateMachine),
 }
 
@@ -251,14 +251,12 @@ pub fn decode_zigzag_slice(buffer: &[u8]) -> Result<Option<(i64, usize)>, Error>
     }
 }
 
-/// Moves `src` into the referenced `dest`, dropping the previous `dest` value.
-pub fn replace_drop<T>(dest: &mut T, src: T) {
-    let _ = std::mem::replace(dest, src);
-}
-
 /// Deserialize a tape to a [`Value`] using the provided [`Schema`].
 ///
 /// The schema must be compatible with the schema used by the original writer.
+///
+/// Both `names` and `extra_names` are checked when a [`Schema::Ref`] is encountered. They're allowed
+/// to have overlapping items.
 ///
 /// # Panics
 /// Can panic if the provided schema does not exactly match the schema used to create the tape. To
@@ -267,16 +265,21 @@ pub fn value_from_tape(
     tape: &mut Vec<ItemRead>,
     schema: &Schema,
     names: &NamesRef,
+    extra_names: &NamesRef,
 ) -> Result<Value, Error> {
-    value_from_tape_internal(&mut tape.drain(..), schema, names, &None)
+    value_from_tape_internal(&mut tape.drain(..), schema, &None, names, extra_names)
 }
 
-/// Recursivily transform the `tape` into a [`Value`] according to the provided [`Schema`].
-pub fn value_from_tape_internal(
+/// Recursively transform the `tape` into a [`Value`] according to the provided [`Schema`].
+///
+/// Both `names` and `extra_names` are checked when a [`Schema::Ref`] is encountered. They're allowed
+/// to have overlapping items.
+pub fn value_from_tape_internal<'a>(
     tape: &mut impl Iterator<Item = ItemRead>,
-    schema: &Schema,
-    names: &NamesRef,
+    schema: &'a Schema,
     enclosing_namespace: &Namespace,
+    names: &NamesRef,
+    extra_names: &NamesRef,
 ) -> Result<Value, Error> {
     match schema {
         Schema::Null => match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
@@ -361,8 +364,9 @@ pub fn value_from_tape_internal(
                     collected.push(value_from_tape_internal(
                         tape,
                         items,
-                        names,
                         enclosing_namespace,
+                        names,
+                        extra_names
                     )?);
                 }
             }
@@ -390,7 +394,7 @@ pub fn value_from_tape_internal(
                             item,
                         }),
                     }?;
-                    let val = value_from_tape_internal(tape, types, names, enclosing_namespace)?;
+                    let val = value_from_tape_internal(tape, types, enclosing_namespace, names, extra_names)?;
                     collected.insert(key, val);
                 }
             }
@@ -424,7 +428,7 @@ pub fn value_from_tape_internal(
             let fqn = name.fully_qualified_name(enclosing_namespace);
             let mut collected = Vec::with_capacity(fields.len());
             for field in fields {
-                let collect = value_from_tape_internal(tape, &field.schema, names, &fqn.namespace)?;
+                let collect = value_from_tape_internal(tape, &field.schema, &fqn.namespace, names, extra_names)?;
                 collected.push((field.name.clone(), collect));
             }
             Ok(Value::Record(collected))
@@ -586,7 +590,9 @@ pub fn value_from_tape_internal(
         Schema::Ref { name } => {
             let fqn = name.fully_qualified_name(enclosing_namespace);
             if let Some(resolved) = names.get(&fqn) {
-                value_from_tape_internal(tape, resolved.borrow(), names, &fqn.namespace)
+                value_from_tape_internal(tape, resolved.borrow(), &fqn.namespace, names, extra_names)
+            } else if let Some(resolved) = extra_names.get(&fqn) {
+                value_from_tape_internal(tape, resolved.borrow(), &fqn.namespace, names, extra_names)
             } else {
                 Err(Details::SchemaResolutionError(fqn).into())
             }

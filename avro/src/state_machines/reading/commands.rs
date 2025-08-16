@@ -7,7 +7,7 @@ use crate::{
     },
     state_machines::reading::{
         ItemRead, SubStateMachine, block::BlockStateMachine, bytes::BytesStateMachine,
-        object::ObjectStateMachine, union::UnionStateMachine,
+        datum::DatumStateMachine, union::UnionStateMachine,
     },
 };
 use std::{collections::HashMap, ops::Range, sync::Arc};
@@ -56,7 +56,7 @@ impl ToRead {
                 read,
             },
             ToRead::Ref(commands) => {
-                SubStateMachine::Object(ObjectStateMachine::new_with_tape(commands, read))
+                SubStateMachine::Object(DatumStateMachine::new_with_tape(commands, read))
             }
             ToRead::Block(commands) => {
                 SubStateMachine::Block(BlockStateMachine::new_with_tape(commands, read))

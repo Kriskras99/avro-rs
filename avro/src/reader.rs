@@ -16,99 +16,47 @@
 // under the License.
 
 //! Logic handling reading from Avro format at user level.
-use crate::{
-    AvroResult,
-    decode::{decode, decode_internal},
-    error::Details,
-    from_value,
-    headers::{HeaderBuilder, RabinFingerprintHeader},
-    schema::{AvroSchema, ResolvedOwnedSchema, ResolvedSchema, Schema},
-    types::Value,
-};
+
+use crate::{error::Details, from_value, headers::HeaderBuilder, schema::{AvroSchema, Schema}, types::Value, AvroResult};
 use serde::de::DeserializeOwned;
-use std::{io::Read, marker::PhantomData};
+use std::io::Read;
+use std::marker::PhantomData;
+use futures::{AsyncRead, AsyncReadExt};
+use crate::headers::RabinFingerprintHeader;
+use crate::schema::ResolvedOwnedSchema;
+pub use crate::state_machines::reading::sync::{
+    Reader, from_avro_datum,
+    from_avro_datum_reader_schemata, from_avro_datum_schemata,
+};
 
-pub use crate::state_machines::reading::sync::ObjectContainerFileReader as Reader;
-
-/// Decode a `Value` encoded in Avro format given its `Schema` and anything implementing `io::Read`
-/// to read from.
-///
-/// In case a reader `Schema` is provided, schema resolution will also be performed.
-///
-/// **NOTE** This function has a quite small niche of usage and does NOT take care of reading the
-/// header and consecutive data blocks; use [`Reader`](struct.Reader.html) if you don't know what
-/// you are doing, instead.
-pub fn from_avro_datum<R: Read>(
-    writer_schema: &Schema,
-    reader: &mut R,
-    reader_schema: Option<&Schema>,
-) -> AvroResult<Value> {
-    let value = decode(writer_schema, reader)?;
-    match reader_schema {
-        Some(schema) => value.resolve(schema),
-        None => Ok(value),
-    }
+pub mod async_reader {
+    pub use crate::state_machines::reading::async_impl::{
+        Reader, from_avro_datum,
+        from_avro_datum_reader_schemata, from_avro_datum_schemata,
+    };
 }
 
-/// Decode a `Value` encoded in Avro format given the provided `Schema` and anything implementing `io::Read`
-/// to read from.
-/// If the writer schema is incomplete, i.e. contains `Schema::Ref`s then it will use the provided
-/// schemata to resolve any dependencies.
-///
-/// In case a reader `Schema` is provided, schema resolution will also be performed.
-pub fn from_avro_datum_schemata<R: Read>(
-    writer_schema: &Schema,
-    writer_schemata: Vec<&Schema>,
-    reader: &mut R,
-    reader_schema: Option<&Schema>,
-) -> AvroResult<Value> {
-    from_avro_datum_reader_schemata(
-        writer_schema,
-        writer_schemata,
-        reader,
-        reader_schema,
-        Vec::with_capacity(0),
-    )
-}
 
-/// Decode a `Value` encoded in Avro format given the provided `Schema` and anything implementing `io::Read`
-/// to read from.
-/// If the writer schema is incomplete, i.e. contains `Schema::Ref`s then it will use the provided
-/// schemata to resolve any dependencies.
+/// Reader for Avro objects created using the [single-object encoding].
 ///
-/// In case a reader `Schema` is provided, schema resolution will also be performed.
-pub fn from_avro_datum_reader_schemata<R: Read>(
-    writer_schema: &Schema,
-    writer_schemata: Vec<&Schema>,
-    reader: &mut R,
-    reader_schema: Option<&Schema>,
-    reader_schemata: Vec<&Schema>,
-) -> AvroResult<Value> {
-    let rs = ResolvedSchema::try_from(writer_schemata)?;
-    let value = decode_internal(writer_schema, rs.get_names(), &None, reader)?;
-    match reader_schema {
-        Some(schema) => {
-            if reader_schemata.is_empty() {
-                value.resolve(schema)
-            } else {
-                value.resolve_schemata(schema, reader_schemata)
-            }
-        }
-        None => Ok(value),
-    }
-}
-
+/// [single-object encoding]: https://avro.apache.org/docs/++version++/specification/#single-object-encoding
 pub struct GenericSingleObjectReader {
     write_schema: ResolvedOwnedSchema,
     expected_header: Vec<u8>,
 }
 
 impl GenericSingleObjectReader {
+    /// Create a reader for the given schema.
+    ///
+    /// This will expect the input to use the [`RabinFingerprintHeader`].
     pub fn new(schema: Schema) -> AvroResult<GenericSingleObjectReader> {
         let header_builder = RabinFingerprintHeader::from_schema(&schema);
         Self::new_with_header_builder(schema, header_builder)
     }
 
+    /// Create a reader for the given schema with a custom fingerprint.
+    ///
+    /// See [`HeaderBuilder`] for details on how to implement a custom fingerprint.
     pub fn new_with_header_builder<HB: HeaderBuilder>(
         schema: Schema,
         header_builder: HB,
@@ -120,17 +68,30 @@ impl GenericSingleObjectReader {
         })
     }
 
+    /// Read a [`Value`] from the reader.
     pub fn read_value<R: Read>(&self, reader: &mut R) -> AvroResult<Value> {
         let mut header = vec![0; self.expected_header.len()];
         match reader.read_exact(&mut header) {
             Ok(_) => {
                 if self.expected_header == header {
-                    decode_internal(
-                        self.write_schema.get_root_schema(),
-                        self.write_schema.get_names(),
-                        &None,
-                        reader,
+                    from_avro_datum(self.write_schema.get_root_schema(), reader, None)
+                } else {
+                    Err(
+                        Details::SingleObjectHeaderMismatch(self.expected_header.clone(), header)
+                            .into(),
                     )
+                }
+            }
+            Err(io_error) => Err(Details::ReadHeader(io_error).into()),
+        }
+    }
+
+    pub async fn read_value_async<R: AsyncRead + Unpin>(&self, reader: &mut R) -> AvroResult<Value> {
+        let mut header = vec![0; self.expected_header.len()];
+        match reader.read_exact(&mut header).await {
+            Ok(_) => {
+                if self.expected_header == header {
+                    async_reader::from_avro_datum(self.write_schema.get_root_schema(), reader, None).await
                 } else {
                     Err(
                         Details::SingleObjectHeaderMismatch(self.expected_header.clone(), header)
@@ -143,6 +104,9 @@ impl GenericSingleObjectReader {
     }
 }
 
+/// Reader for Avro objects created using the [single-object encoding] deserializing directly to `T`.
+///
+/// [single-object encoding]: https://avro.apache.org/docs/++version++/specification/#single-object-encoding
 pub struct SpecificSingleObjectReader<T>
 where
     T: AvroSchema,
@@ -155,6 +119,7 @@ impl<T> SpecificSingleObjectReader<T>
 where
     T: AvroSchema,
 {
+    /// Create the reader from the schema associated with `T`.
     pub fn new() -> AvroResult<SpecificSingleObjectReader<T>> {
         Ok(SpecificSingleObjectReader {
             inner: GenericSingleObjectReader::new(T::get_schema())?,
@@ -167,8 +132,14 @@ impl<T> SpecificSingleObjectReader<T>
 where
     T: AvroSchema + From<Value>,
 {
+    /// Read a `T` from the reader.
     pub fn read_from_value<R: Read>(&self, reader: &mut R) -> AvroResult<T> {
         self.inner.read_value(reader).map(|v| v.into())
+    }
+
+    /// Read a `T` from the reader.
+    pub async fn read_from_value_async<R: AsyncRead + Unpin>(&self, reader: &mut R) -> AvroResult<T> {
+        self.inner.read_value_async(reader).map(|v| v.into()).await
     }
 }
 
@@ -176,12 +147,20 @@ impl<T> SpecificSingleObjectReader<T>
 where
     T: AvroSchema + DeserializeOwned,
 {
+    /// Read a `T` from the reader.
     pub fn read<R: Read>(&self, reader: &mut R) -> AvroResult<T> {
         from_value::<T>(&self.inner.read_value(reader)?)
     }
+
+    pub async fn read_async<R: AsyncRead + Unpin>(&self, reader: &mut R) -> AvroResult<T> {
+        from_value::<T>(&self.inner.read_value_async(reader).await?)
+    }
 }
 
-/// Reads the marker bytes from Avro bytes generated earlier by a `Writer`
+
+/// Reads the marker bytes from Avro bytes generated earlier by a [`Writer`].
+///
+/// [`Writer`]: crate::Writer
 pub fn read_marker(bytes: &[u8]) -> [u8; 16] {
     assert!(
         bytes.len() > 16,

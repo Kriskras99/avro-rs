@@ -1,15 +1,17 @@
-use std::{collections::HashMap, io::Read};
-
 use oval::Buffer;
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
+use std::{collections::HashMap, io::Read, marker::PhantomData};
 
 use crate::{
-    Error, Schema,
+    AvroResult, AvroSchema, Error, Schema,
     error::Details,
-    schema::{Namespace, ResolvedSchema},
+    from_value,
+    headers::{HeaderBuilder, RabinFingerprintHeader},
+    schema::{Namespace, ResolvedOwnedSchema, ResolvedSchema},
     state_machines::reading::{
         ItemRead, StateMachine, StateMachineControlFlow,
         commands::CommandTape,
+        datum::DatumStateMachine,
         deserialize_from_tape,
         object_container_file::{
             ObjectContainerFileBodyStateMachine, ObjectContainerFileHeader,
@@ -19,44 +21,92 @@ use crate::{
     },
     types::Value,
 };
+use crate::schema_compatibility::SchemaCompatibility;
 
-pub struct ObjectContainerFileReader<'a, R> {
+/// Main interface for reading Avro formatted values.
+///
+/// To be used as an iterator:
+///
+/// ```no_run
+/// # use apache_avro::Reader;
+/// # use std::io::Cursor;
+/// # let input = Cursor::new(Vec::<u8>::new());
+/// for value in Reader::new(input).unwrap() {
+///     match value {
+///         Ok(v) => println!("{:?}", v),
+///         Err(e) => println!("Error: {}", e),
+///     };
+/// }
+/// ```
+pub struct Reader<'a, R> {
     reader_schema: Option<&'a Schema>,
     resolved_schemata: ResolvedSchema<'a>,
+    extra_resolved_schemata: ResolvedSchema<'a>,
     header: ObjectContainerFileHeader,
     fsm: Option<ObjectContainerFileBodyStateMachine>,
     reader: R,
     buffer: Buffer,
 }
 
-impl<'a, R: Read> ObjectContainerFileReader<'a, R> {
-    /// Create a new reader for the Object Container file format.
+impl<'a, R: Read> Reader<'a, R> {
+    /// Creates a [`Reader`] that will use the schema from the file header.
+    ///
+    /// No reader [`Schema`] will be set.
+    ///
+    /// **NOTE** The Avro header is going to be read automatically upon creation of the [`Reader`].
     pub fn new(reader: R) -> Result<Self, Error> {
-        Self::new_schemata(reader, Vec::new())
+        Self::new_inner(reader, None, Vec::new())
     }
 
+    /// Creates a [`Reader`] that will use the given schema for schema resolution.
+    ///
+    /// **NOTE** The Avro header is going to be read automatically upon creation of the [`Reader`].
     pub fn with_schema(schema: &'a Schema, reader: R) -> Result<Self, Error> {
-        let mut new = Self::new_schemata(reader, Vec::new())?;
-        new.reader_schema = Some(schema);
-        Ok(new)
+        Self::new_inner(reader, Some(schema), Vec::new())
     }
 
+    /// Creates a [`Reader`] that will use the given schema for schema resolution.
+    ///
+    /// Any [`Schema::Ref`] will be resolved using the schemata.
+    ///
+    /// **NOTE** The avro header is going to be read automatically upon creation of the [`Reader`].
     pub fn with_schemata(
         schema: &'a Schema,
         schemata: Vec<&'a Schema>,
         reader: R,
     ) -> Result<Self, Error> {
-        let mut new = Self::new_schemata(reader, schemata)?;
-        new.reader_schema = Some(schema);
-        Ok(new)
+        Self::new_inner(reader, Some(schema), schemata)
     }
 
-    fn new_schemata(mut reader: R, schemata: Vec<&'a Schema>) -> Result<Self, Error> {
+    /// Get a reference to the writer [`Schema`].
+    pub fn writer_schema(&self) -> &Schema {
+        &self.header.schema
+    }
+
+    /// Get a reference to the optional reader [`Schema`].
+    ///
+    /// This will only be set if there was a reader schema provided and it differed from the
+    /// writer schema.
+    pub fn reader_schema(&self) -> Option<&'a Schema> {
+        self.reader_schema
+    }
+
+    /// Get a reference to the user metadata.
+    pub fn user_metadata(&self) -> &HashMap<String, Vec<u8>> {
+        &self.header.metadata
+    }
+
+    /// Get a reference to the file header.
+    pub fn header(&self) -> &ObjectContainerFileHeader {
+        &self.header
+    }
+
+    fn new_inner(mut reader: R, reader_schema: Option<&'a Schema>, schemata: Vec<&'a Schema>) -> Result<Self, Error> {
         // Read a maximum of 2Kb per read
         let mut buffer = Buffer::with_capacity(2 * 1024);
 
         // Parse the header
-        let rs = ResolvedSchema::try_from(schemata)?;
+        let rs = ResolvedSchema::try_from(schemata.clone())?;
         let mut fsm = ObjectContainerFileHeaderStateMachine::new(rs.get_names());
         let header = loop {
             // Fill the buffer
@@ -74,10 +124,18 @@ impl<'a, R: Read> ObjectContainerFileReader<'a, R> {
         };
 
         let tape = CommandTape::build_from_schema(&header.schema, rs.get_names())?;
+        let extra_resolved_schemata = ResolvedSchema::new_with_known_schemata(vec![&header.schema], &None, rs.get_names())?;
+
+        let reader_schema = if let Some(schema) = reader_schema && schema != &header.schema {
+            Some(schema)
+        } else {
+            None
+        };
 
         Ok(Self {
-            reader_schema: None,
+            reader_schema,
             resolved_schemata: rs,
+            extra_resolved_schemata,
             fsm: Some(ObjectContainerFileBodyStateMachine::new(
                 tape,
                 header.sync,
@@ -87,22 +145,6 @@ impl<'a, R: Read> ObjectContainerFileReader<'a, R> {
             reader,
             buffer,
         })
-    }
-
-    pub fn writer_schema(&self) -> &Schema {
-        &self.header.schema
-    }
-
-    pub fn reader_schema(&self) -> Option<&'a Schema> {
-        self.reader_schema
-    }
-
-    pub fn user_metadata(&self) -> &HashMap<String, Vec<u8>> {
-        &self.header.metadata
-    }
-
-    pub fn header(&self) -> &ObjectContainerFileHeader {
-        &self.header
     }
 
     /// Get the next object in the file
@@ -140,69 +182,152 @@ impl<'a, R: Read> ObjectContainerFileReader<'a, R> {
         None
     }
 
+    /// Deserialize the next object directly to `T`.
+    ///
+    /// This function goes immediately from the inner representation to `T` without going through
+    /// [`Value`] first. It does not support schema resolution using a reader [`Schema`].
+    ///
+    /// # Panics
+    /// Will panic if a reader [`Schema`] was supplied when creating the [`Reader`].
     pub fn next_serde<'b, T: Deserialize<'b>>(&mut self) -> Option<Result<T, Error>> {
         assert!(
             self.reader_schema.is_none(),
-            "Reader schema is not supported with Serde!"
+            "Schema resolution is not supported with this function!"
         );
         self.next_object()
             .map(|r| r.and_then(|mut tape| deserialize_from_tape(&mut tape, &self.header.schema)))
     }
 }
 
-impl<R: Read> Iterator for ObjectContainerFileReader<'_, R> {
+impl<R: Read> Iterator for Reader<'_, R> {
     type Item = Result<Value, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next_object().map(|r| {
             r.and_then(|mut tape| {
-                // TODO: There must be a better way than this
-                let rst = ResolvedSchema::new_with_known_schemata(
-                    vec![&self.header.schema],
-                    &Namespace::None,
-                    self.resolved_schemata.get_names(),
-                )
-                .unwrap();
-                let mut names = HashMap::new();
-                names.extend(
-                    rst.get_names()
-                        .iter()
-                        .map(|(key, &value)| (key.clone(), value)),
-                );
-                names.extend(
-                    self.resolved_schemata
-                        .get_names()
-                        .iter()
-                        .map(|(key, &value)| (key.clone(), value)),
-                );
-                value_from_tape(&mut tape, &self.header.schema, &names)
+                value_from_tape(&mut tape, &self.header.schema, self.resolved_schemata.get_names(), self.extra_resolved_schemata.get_names())
             })
             .and_then(|v| {
                 if let Some(schema) = &self.reader_schema {
-                    // TODO: There must be a better way than this
-                    let rst = ResolvedSchema::new_with_known_schemata(
-                        vec![&self.header.schema],
-                        &Namespace::None,
-                        self.resolved_schemata.get_names(),
-                    )
-                    .unwrap();
-                    let mut names = HashMap::new();
-                    names.extend(
-                        rst.get_names()
-                            .iter()
-                            .map(|(key, &value)| (key.clone(), value)),
-                    );
-                    names.extend(
-                        self.resolved_schemata
-                            .get_names()
-                            .iter()
-                            .map(|(key, &value)| (key.clone(), value)),
-                    );
-                    v.resolve_internal(schema, &names, &Namespace::None, &None)
+                    v.resolve_internal(schema, self.resolved_schemata.get_names(), &None, &None)
                 } else {
                     Ok(v)
                 }
             })
         })
+    }
+}
+
+/// Decode a raw Avro datum using the provided [`Schema`].
+///
+/// In case a reader [`Schema`] is provided, schema resolution will be performed.
+///
+/// **NOTE** This function is very niche and does NOT take care of reading the header and
+/// consecutive data blocks. use [`Reader`] if you just want to read an Avro encoded file.
+pub fn from_avro_datum<R: Read>(
+    writer_schema: &Schema,
+    reader: &mut R,
+    reader_schema: Option<&Schema>,
+) -> AvroResult<Value> {
+    from_avro_datum_reader_schemata(writer_schema, Vec::new(), reader, reader_schema, Vec::new())
+}
+
+/// Decode a raw Avro datum using the provided [`Schema`] and schemata.
+///
+/// If the writer schema contains any [`Schema::Ref`] then it will use the provided
+/// schemata to resolve any dependencies.
+///
+/// In case a reader [`Schema`] is provided, schema resolution will be performed.
+pub fn from_avro_datum_schemata<R: Read>(
+    writer_schema: &Schema,
+    writer_schemata: Vec<&Schema>,
+    reader: &mut R,
+    reader_schema: Option<&Schema>,
+) -> AvroResult<Value> {
+    from_avro_datum_reader_schemata(
+        writer_schema,
+        writer_schemata,
+        reader,
+        reader_schema,
+        Vec::new(),
+    )
+}
+
+/// Decode a raw Avro datum using the provided [`Schema`] and schemata.
+///
+/// If the writer schema contains any [`Schema::Ref`] then it will use the provided
+/// schemata to resolve any dependencies.
+///
+/// In case a reader [`Schema`] is provided, schema resolution will be performed.
+pub fn from_avro_datum_reader_schemata<R: Read>(
+    writer_schema: &Schema,
+    writer_schemata: Vec<&Schema>,
+    reader: &mut R,
+    reader_schema: Option<&Schema>,
+    reader_schemata: Vec<&Schema>,
+) -> AvroResult<Value> {
+    let rs = ResolvedSchema::try_from(writer_schemata)?;
+    let tape = CommandTape::build_from_schema(&writer_schema, &rs.get_names())?;
+    // Read a maximum of 2Kb per read
+    let mut buffer = Buffer::with_capacity(2 * 1024);
+    let mut fsm = DatumStateMachine::new(tape);
+    let value = loop {
+        // Fill the buffer
+        let n = reader.read(buffer.space()).map_err(Details::ReadHeader)?;
+        if n == 0 {
+            return Err(Details::ReadHeader(std::io::ErrorKind::UnexpectedEof.into()).into());
+        }
+        buffer.fill(n);
+
+        match fsm.parse(&mut buffer)? {
+            StateMachineControlFlow::NeedMore(new_fsm) => {
+                fsm = new_fsm;
+            }
+            StateMachineControlFlow::Done(mut tape) => {
+                break value_from_tape(&mut tape, &writer_schema, &rs.get_names(), &HashMap::new())?;
+            }
+        }
+    };
+    match reader_schema {
+        Some(schema) => {
+            if reader_schemata.is_empty() {
+                value.resolve(schema)
+            } else {
+                value.resolve_schemata(schema, reader_schemata)
+            }
+        }
+        None => Ok(value),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Schema, Writer, state_machines::reading::sync::Reader, types::Value};
+    use std::io::Cursor;
+
+    /// Test it reads all the sync markers
+    #[test]
+    fn sync_markers() {
+        let mut writer = Writer::new(&Schema::String, Vec::new());
+        writer.append(Value::String("Hello".to_string())).unwrap();
+        writer.flush().unwrap();
+        writer.append(Value::String("World".to_string())).unwrap();
+        writer.flush().unwrap();
+        let mut written = Cursor::new(writer.into_inner().unwrap());
+
+        let mut reader = Reader::new(&mut written).unwrap();
+        assert_eq!(
+            reader.next().unwrap().unwrap(),
+            Value::String("Hello".to_string())
+        );
+        assert_eq!(
+            reader.next().unwrap().unwrap(),
+            Value::String("World".to_string())
+        );
+
+        drop(reader);
+        let position = written.position();
+        let expected = written.into_inner().len();
+        assert_eq!(position, expected as u64);
     }
 }

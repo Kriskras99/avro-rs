@@ -79,6 +79,7 @@ zstd = { default-features = false, version = "0.13.3", optional = true }
 oval = { version = "2.0.0", features = ["bytes"] }
 futures = "0.3.31"
 async-stream = "0.3.6"
+colored-hexdump = "0.2.2"
 
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

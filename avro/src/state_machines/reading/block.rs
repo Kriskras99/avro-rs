@@ -4,15 +4,15 @@ use crate::{
     Error,
     error::Details,
     state_machines::reading::{
-        CommandTape, ItemRead, StateMachine, StateMachineControlFlow, decode_zigzag_buffer,
-        object::ObjectStateMachine,
+        CommandTape, ItemRead, StateMachine, StateMachineControlFlow, datum::DatumStateMachine,
+        decode_zigzag_buffer,
     },
 };
 
 /// Are we currently parsing an object or just finished/reading a block header
 enum TapeOrFsm {
     Tape(Vec<ItemRead>),
-    Fsm(ObjectStateMachine),
+    Fsm(DatumStateMachine),
 }
 
 pub struct BlockStateMachine {
@@ -86,7 +86,7 @@ impl StateMachine for BlockStateMachine {
 
                     // We've either finished reading the block header or the last object was read and
                     // left_in_current_block is not zero
-                    self.tape_or_fsm = TapeOrFsm::Fsm(ObjectStateMachine::new_with_tape(
+                    self.tape_or_fsm = TapeOrFsm::Fsm(DatumStateMachine::new_with_tape(
                         self.command_tape.clone(),
                         tape,
                     ))

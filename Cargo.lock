@@ -55,6 +55,7 @@ dependencies = [
  "bigdecimal",
  "bon",
  "bzip2",
+ "colored-hexdump",
  "crc32fast",
  "criterion",
  "digest",
@@ -318,6 +319,12 @@ name = "clap_lex"
 version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f46ad14479a25103f283c0f10005961cf086d8dc42205bb44c46ac563475dca6"
+
+[[package]]
+name = "colored-hexdump"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "831aef047609eb5f6b87b366e58b9ed1a14e494df7867db856f03de0287d62e8"
 
 [[package]]
 name = "console"
