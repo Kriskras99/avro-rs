@@ -2,7 +2,7 @@ use oval::Buffer;
 
 use crate::{
     error::Details,
-    state_machines::reading::{StateMachine, StateMachineControlFlow, decode_zigzag_buffer},
+    decode::{StateMachine, StateMachineControlFlow, decode_zigzag_buffer},
 };
 
 use super::StateMachineResult;

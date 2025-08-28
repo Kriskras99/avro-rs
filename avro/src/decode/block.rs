@@ -3,7 +3,7 @@ use oval::Buffer;
 use crate::{
     Error,
     error::Details,
-    state_machines::reading::{
+    decode::{
         CommandTape, ItemRead, StateMachine, StateMachineControlFlow, datum::DatumStateMachine,
         decode_zigzag_buffer,
     },

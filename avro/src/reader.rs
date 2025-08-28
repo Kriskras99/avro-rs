@@ -17,7 +17,7 @@
 
 //! Logic handling reading from Avro format at user level.
 
-pub use crate::state_machines::reading::sync::{
+pub use crate::decode::sync::{
     Reader, from_avro_datum, from_avro_datum_reader_schemata, from_avro_datum_schemata,
 };
 use crate::{
@@ -34,7 +34,7 @@ use std::{io::Read, marker::PhantomData};
 
 pub mod async_reader {
     #[doc(inline)]
-    pub use crate::state_machines::reading::async_impl::{
+    pub use crate::decode::async_impl::{
         Reader, from_avro_datum, from_avro_datum_reader_schemata, from_avro_datum_schemata,
     };
 }

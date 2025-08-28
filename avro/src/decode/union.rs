@@ -1,6 +1,6 @@
 use crate::{
     error::Details,
-    state_machines::reading::{
+    decode::{
         ItemRead, StateMachine, StateMachineControlFlow, StateMachineResult, SubStateMachine,
         commands::CommandTape, decode_zigzag_buffer,
     },

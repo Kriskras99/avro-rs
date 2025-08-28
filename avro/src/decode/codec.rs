@@ -1,6 +1,6 @@
 use crate::{
     Codec,
-    state_machines::reading::{StateMachine, StateMachineControlFlow, StateMachineResult},
+    decode::{StateMachine, StateMachineControlFlow, StateMachineResult},
 };
 use oval::Buffer;
 

@@ -869,10 +869,10 @@ mod encode;
 mod reader;
 mod ser;
 mod ser_schema;
-pub mod state_machines;
 mod util;
 mod writer;
 
+pub mod decode;
 pub mod error;
 pub mod headers;
 pub mod rabin;

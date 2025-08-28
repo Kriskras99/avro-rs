@@ -17,7 +17,7 @@
 
 use crate::{
     schema::{Name, Schema, SchemaKind, UnionSchema},
-    state_machines::reading::error::ValueFromTapeError,
+    decode::error::ValueFromTapeError,
     types::{Value, ValueKind},
 };
 use std::{error::Error as _, fmt};

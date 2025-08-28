@@ -1,22 +1,18 @@
+/// The state machines used in [`Reader`] and [`AsyncReader`] to decode Avro datums.
+/// 
+/// These should not be used directly unless you are implementing your own reader.
+
 use crate::{
-    Decimal, Duration, Error, Schema,
-    bigdecimal::deserialize_big_decimal,
-    error::Details,
-    schema::{
-        ArraySchema, EnumSchema, FixedSchema, MapSchema, Name, Names, Namespace, RecordSchema,
-        ResolvedSchema, UnionSchema,
-    },
-    state_machines::reading::{
-        block::BlockStateMachine, bytes::BytesStateMachine, commands::CommandTape,
-        datum::DatumStateMachine, error::ValueFromTapeError, union::UnionStateMachine,
-    },
-    types::Value,
-    util::decode_variable,
+    error::Details, util::decode_variable, Error
 };
+use block::BlockStateMachine;
+use bytes::BytesStateMachine;
+use commands::CommandTape;
+use datum::DatumStateMachine;
+use items::ItemRead;
+use union::UnionStateMachine;
 use oval::Buffer;
-use serde::Deserialize;
-use std::{borrow::Borrow, collections::HashMap, io::Read, ops::Deref, str::FromStr};
-use uuid::Uuid;
+use std::{io::Read};
 
 pub mod async_impl;
 pub mod block;
@@ -28,13 +24,36 @@ pub mod error;
 mod object_container_file;
 pub mod sync;
 mod union;
+pub mod items;
 
+/// A state machine that can progress as long as there are new bytes to consume.
+/// 
+/// # Usage
+/// The state machine expects to run through a byte stream from start to end. It however does
+/// not expect to have all bytes available to it at once. It will keep returning [`StateMachineControlFlow::NeedMore`]
+/// while it's expecting more bytes, if the byte stream is finished but the state machine isn't this
+/// indicates a corrupt byte stream.
+/// 
+// /// ```no_run
+// /// let mut fsm = SubStateMachine::Bool(Vec::new());
+// /// let mut buffer = Buffer::with_capacity(2048);
+// /// let result = loop {
+// ///     let n = byte_stream.read(buffer.space())?;
+// ///     buffer.fill(n);
+// /// 
+// ///     match fsm.parse(&mut buffer)? {
+//             StateMachineControlFlow::NeedMore(new_fsm) => fsm = new_fsm,
+//             StateMachineControlFlow::Done(result) => break result,
+// ///     }
+// /// }
+// /// ```
 pub trait StateMachine: Sized {
+    /// The output type of the state machine.
     type Output: Sized;
 
     /// Start/continue the state machine.
     ///
-    /// Implementers are not allowed to return until they can't make progress anymore.
+    /// Implementers are not allowed to return until they can't make progress.
     fn parse(self, buffer: &mut Buffer) -> StateMachineResult<Self, Self::Output>;
 }
 
@@ -50,11 +69,11 @@ pub enum StateMachineControlFlow<StateMachine, Output> {
 pub type StateMachineResult<StateMachine, Output> =
     Result<StateMachineControlFlow<StateMachine, Output>, Error>;
 
-/// The sub state machine that is currently being driven.
-///
-/// The `Int`, `Long`, `Float`, `Double`, and `Enum` statemachines don't have state, as
-/// they don't consume the buffer if there are not enough bytes. This means that the only
-/// thing these statemachines are keeping track of is which type we're actually decoding.
+/// The state machine that is currently being driven.
+/// 
+/// The basic statemachines only track the current type being decoded and have the item tape.
+/// The more complex statemachines have their own implementation of [`StateMachine`] that's
+/// being delegated to.
 pub enum SubStateMachine {
     Null(Vec<ItemRead>),
     Bool(Vec<ItemRead>),
@@ -186,408 +205,18 @@ impl StateMachine for SubStateMachine {
     }
 }
 
-/// A item that was read from the document.
-#[derive(Debug)]
-#[must_use]
-pub enum ItemRead {
-    Null,
-    Boolean(bool),
-    Int(i32),
-    Long(i64),
-    Float(f32),
-    Double(f64),
-    // TODO: smollvec/hipbytes?
-    Bytes(Vec<u8>),
-    // TODO: smollstr/hipstr?
-    String(String),
-    /// The variant of the Enum that was read.
-    Enum(u32),
-    /// The variant of the Union that was read.
-    ///
-    /// The variant data is next.
-    Union(u32),
-    /// The start of a block of a Map or Array.
-    Block(usize),
-}
-
 /// Read a zigzagged varint from the buffer.
 ///
 /// Will only consume the buffer if a whole number has been read.
 /// If insufficient bytes are available it will return `Ok(None)` to
 /// indicate it needs more bytes.
-pub fn decode_zigzag_buffer(buffer: &mut Buffer) -> Result<Option<i64>, Error> {
+fn decode_zigzag_buffer(buffer: &mut Buffer) -> Result<Option<i64>, Error> {
     if let Some((decoded, consumed)) = decode_variable(buffer.data())? {
         buffer.consume(consumed);
         Ok(Some(decoded))
     } else {
         Ok(None)
     }
-}
-
-/// Deserialize a tape to a [`Value`] using the provided [`Schema`].
-///
-/// The schema must be compatible with the schema used by the original writer.
-///
-/// Both `names` and `extra_names` are checked when a [`Schema::Ref`] is encountered. They're allowed
-/// to have overlapping items.
-///
-/// # Panics
-/// Can panic if the provided schema does not exactly match the schema used to create the tape. To
-/// convert between the writer and reader schema use [`Value::resolve`] instead.
-pub fn value_from_tape(
-    tape: &mut Vec<ItemRead>,
-    schema: &Schema,
-    names: &Names,
-) -> Result<Value, Error> {
-    value_from_tape_internal(&mut tape.drain(..), schema, &None, names)
-}
-
-/// Recursively transform the `tape` into a [`Value`] according to the provided [`Schema`].
-///
-/// Both `names` and `extra_names` are checked when a [`Schema::Ref`] is encountered. They're allowed
-/// to have overlapping items.
-pub fn value_from_tape_internal(
-    tape: &mut impl Iterator<Item = ItemRead>,
-    schema: &Schema,
-    enclosing_namespace: &Namespace,
-    names: &Names,
-) -> Result<Value, Error> {
-    match schema {
-        Schema::Null => match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-            ItemRead::Null => Ok(Value::Null),
-            item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                schema: schema.clone(),
-                item,
-            }
-            .into()),
-        },
-        Schema::Boolean => match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-            ItemRead::Boolean(bool) => Ok(Value::Boolean(bool)),
-            item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                schema: schema.clone(),
-                item,
-            }
-            .into()),
-        },
-        Schema::Int => match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-            ItemRead::Int(bool) => Ok(Value::Int(bool)),
-            item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                schema: schema.clone(),
-                item,
-            }
-            .into()),
-        },
-        Schema::Long => match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-            ItemRead::Long(long) => Ok(Value::Long(long)),
-            item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                schema: schema.clone(),
-                item,
-            }
-            .into()),
-        },
-        Schema::Float => match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-            ItemRead::Float(float) => Ok(Value::Float(float)),
-            item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                schema: schema.clone(),
-                item,
-            }
-            .into()),
-        },
-        Schema::Double => match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-            ItemRead::Double(double) => Ok(Value::Double(double)),
-            item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                schema: schema.clone(),
-                item,
-            }
-            .into()),
-        },
-        Schema::Bytes => match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-            ItemRead::Bytes(bytes) => Ok(Value::Bytes(bytes)),
-            item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                schema: schema.clone(),
-                item,
-            }
-            .into()),
-        },
-        Schema::String => match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-            ItemRead::String(string) => Ok(Value::String(string)),
-            item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                schema: schema.clone(),
-                item,
-            }
-            .into()),
-        },
-        Schema::Array(ArraySchema { items, .. }) => {
-            let mut collected = Vec::new();
-            loop {
-                let n = match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-                    ItemRead::Block(n) => Ok(n),
-                    item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                        schema: schema.clone(),
-                        item,
-                    }),
-                }?;
-                if n == 0 {
-                    break;
-                }
-                collected.reserve(n);
-                for _ in 0..n {
-                    collected.push(value_from_tape_internal(
-                        tape,
-                        items,
-                        enclosing_namespace,
-                        names,
-                    )?);
-                }
-            }
-            Ok(Value::Array(collected))
-        }
-        Schema::Map(MapSchema { types, .. }) => {
-            let mut collected = HashMap::new();
-            loop {
-                let n = match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-                    ItemRead::Block(n) => Ok(n),
-                    item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                        schema: schema.clone(),
-                        item,
-                    }),
-                }?;
-                if n == 0 {
-                    break;
-                }
-                collected.reserve(n);
-                for _ in 0..n {
-                    let key = match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-                        ItemRead::String(string) => Ok(string),
-                        item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                            schema: Schema::String,
-                            item,
-                        }),
-                    }?;
-                    let val = value_from_tape_internal(tape, types, enclosing_namespace, names)?;
-                    collected.insert(key, val);
-                }
-            }
-            Ok(Value::Map(collected))
-        }
-        Schema::Union(UnionSchema { schemas, .. }) => {
-            match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-                ItemRead::Union(variant) => {
-                    let schema = schemas.get(usize::try_from(variant).unwrap()).ok_or(
-                        Details::GetUnionVariant {
-                            index: variant as i64,
-                            num_variants: schemas.len(),
-                        },
-                    )?;
-                    let value = Box::new(value_from_tape_internal(
-                        tape,
-                        schema,
-                        enclosing_namespace,
-                        names,
-                    )?);
-                    Ok(Value::Union(variant, value))
-                }
-                item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                    schema: schema.clone(),
-                    item,
-                }
-                .into()),
-            }
-        }
-        Schema::Record(RecordSchema { name, fields, .. }) => {
-            let fqn = name.fully_qualified_name(enclosing_namespace);
-            let mut collected = Vec::with_capacity(fields.len());
-            for field in fields {
-                let collect = value_from_tape_internal(tape, &field.schema, &fqn.namespace, names)?;
-                collected.push((field.name.clone(), collect));
-            }
-            Ok(Value::Record(collected))
-        }
-        Schema::Enum(EnumSchema { symbols, .. }) => {
-            match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-                ItemRead::Enum(val) => Ok(Value::Enum(
-                    val,
-                    symbols.get(usize::try_from(val).unwrap()).unwrap().clone(),
-                )),
-                item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                    schema: schema.clone(),
-                    item,
-                }
-                .into()),
-            }
-        }
-        Schema::Fixed(FixedSchema { size, .. }) => {
-            match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-                ItemRead::Bytes(fixed) => {
-                    if *size == fixed.len() {
-                        Ok(Value::Fixed(fixed.len(), fixed))
-                    } else {
-                        Err(ValueFromTapeError::TapeSchemaMismatchFixed {
-                            expected: *size,
-                            actual: fixed.len(),
-                        }
-                        .into())
-                    }
-                }
-                item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                    schema: schema.clone(),
-                    item,
-                }
-                .into()),
-            }
-        }
-        Schema::Decimal(_) => match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-            ItemRead::Bytes(bytes) => Ok(Value::Decimal(Decimal::from(&bytes))),
-            item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                schema: schema.clone(),
-                item,
-            }
-            .into()),
-        },
-        Schema::BigDecimal => match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-            ItemRead::Bytes(bytes) => deserialize_big_decimal(&bytes).map(Value::BigDecimal),
-            item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                schema: schema.clone(),
-                item,
-            }
-            .into()),
-        },
-        Schema::Uuid => match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-            ItemRead::String(string) => Uuid::from_str(&string)
-                .map(Value::Uuid)
-                .map_err(|e| Details::ConvertStrToUuid(e).into()),
-            item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                schema: schema.clone(),
-                item,
-            }
-            .into()),
-        },
-        Schema::Date => match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-            ItemRead::Int(int) => Ok(Value::Date(int)),
-            item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                schema: schema.clone(),
-                item,
-            }
-            .into()),
-        },
-        Schema::TimeMillis => match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-            ItemRead::Int(int) => Ok(Value::TimeMillis(int)),
-            item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                schema: schema.clone(),
-                item,
-            }
-            .into()),
-        },
-        Schema::TimeMicros => match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-            ItemRead::Long(long) => Ok(Value::TimeMicros(long)),
-            item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                schema: schema.clone(),
-                item,
-            }
-            .into()),
-        },
-        Schema::TimestampMillis => {
-            match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-                ItemRead::Long(long) => Ok(Value::TimestampMillis(long)),
-                item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                    schema: schema.clone(),
-                    item,
-                }
-                .into()),
-            }
-        }
-        Schema::TimestampMicros => {
-            match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-                ItemRead::Long(long) => Ok(Value::TimestampMicros(long)),
-                item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                    schema: schema.clone(),
-                    item,
-                }
-                .into()),
-            }
-        }
-        Schema::TimestampNanos => {
-            match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-                ItemRead::Long(long) => Ok(Value::TimestampNanos(long)),
-                item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                    schema: schema.clone(),
-                    item,
-                }
-                .into()),
-            }
-        }
-        Schema::LocalTimestampMillis => {
-            match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-                ItemRead::Long(long) => Ok(Value::LocalTimestampMillis(long)),
-                item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                    schema: schema.clone(),
-                    item,
-                }
-                .into()),
-            }
-        }
-        Schema::LocalTimestampMicros => {
-            match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-                ItemRead::Long(long) => Ok(Value::LocalTimestampMicros(long)),
-                item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                    schema: schema.clone(),
-                    item,
-                }
-                .into()),
-            }
-        }
-        Schema::LocalTimestampNanos => {
-            match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-                ItemRead::Long(long) => Ok(Value::LocalTimestampNanos(long)),
-                item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                    schema: schema.clone(),
-                    item,
-                }
-                .into()),
-            }
-        }
-        Schema::Duration => match tape.next().ok_or(ValueFromTapeError::UnexpectedEndOfTape)? {
-            ItemRead::Bytes(bytes) => {
-                let array: [u8; 12] = bytes.deref().try_into().unwrap();
-                Ok(Value::Duration(Duration::from(array)))
-            }
-            item => Err(ValueFromTapeError::TapeSchemaMismatch {
-                schema: schema.clone(),
-                item,
-            }
-            .into()),
-        },
-        Schema::Ref { name } => {
-            let fqn = name.fully_qualified_name(enclosing_namespace);
-            if let Some(resolved) = names.get(&fqn) {
-                value_from_tape_internal(tape, resolved, &fqn.namespace, names)
-            } else {
-                Err(Details::SchemaResolutionError(fqn).into())
-            }
-        }
-    }
-}
-
-/// Deserialize a tape to `T` using the provided [`Schema`].
-///
-/// The schema must be compatible with the schema used by the original writer.
-pub fn deserialize_from_tape<'a, T: Deserialize<'a>>(
-    tape: &mut Vec<ItemRead>,
-    schema: &Schema,
-) -> Result<T, Error> {
-    let rs = ResolvedSchema::try_from(schema)?;
-    deserialize_from_tape_internal(tape, schema, rs.get_names(), &None)
-}
-
-/// Recursively transform the `tape` into a `T` according to the provided [`Schema`].
-fn deserialize_from_tape_internal<'a, T: Deserialize<'a>, S: Borrow<Schema>>(
-    tape: &mut Vec<ItemRead>,
-    _schema: &Schema,
-    _names: &HashMap<Name, S>,
-    _enclosing_namespace: &Namespace,
-) -> Result<T, Error> {
-    tape.clear();
-    todo!()
 }
 
 #[cfg(test)]
