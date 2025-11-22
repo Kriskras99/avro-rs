@@ -779,11 +779,11 @@ mod tests {
         Reader,
         decimal::Decimal,
         duration::{Days, Duration, Millis, Months},
+        encode::zig_i64,
         headers::GlueSchemaUuidHeader,
         rabin::Rabin,
         schema::{DecimalSchema, FixedSchema, Name},
         types::Record,
-        util::zig_i64,
     };
     use pretty_assertions::assert_eq;
     use serde::{Deserialize, Serialize};

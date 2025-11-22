@@ -27,7 +27,7 @@ use crate::{
         Schema,
     },
     types::Value,
-    util::{safe_len, zag_i32, zag_i64},
+    util::safe_len,
 };
 use std::{
     borrow::Borrow,
@@ -35,6 +35,53 @@ use std::{
     io::{ErrorKind, Read},
 };
 use uuid::Uuid;
+
+pub(crate) fn read_long<R: Read>(reader: &mut R) -> AvroResult<i64> {
+    zag_i64(reader)
+}
+
+/// Decode a zigzagged varint from the reader.
+pub(crate) fn zag_i32<R: Read>(reader: &mut R) -> AvroResult<i32> {
+    let i = zag_i64(reader)?;
+    i32::try_from(i).map_err(|e| Details::ZagI32(e, i).into())
+}
+
+/// Decode a zigzagged varint from the reader.
+pub(crate) fn zag_i64<R: Read>(reader: &mut R) -> AvroResult<i64> {
+    let z = decode_variable(reader)?;
+    Ok(if z & 0x1 == 0 {
+        (z >> 1) as i64
+    } else {
+        !(z >> 1) as i64
+    })
+}
+
+/// Read a varint from the reader.
+///
+/// Note: this function does not do zigzag decoding, for that see [`zag_i32`] and [`zag_i64`].
+fn decode_variable<R: Read>(reader: &mut R) -> AvroResult<u64> {
+    let mut i = 0u64;
+    let mut buf = [0u8; 1];
+
+    let mut j = 0;
+    loop {
+        if j > 9 {
+            // if j * 7 > 64
+            return Err(Details::IntegerOverflow.into());
+        }
+        reader
+            .read_exact(&mut buf[..])
+            .map_err(Details::ReadVariableIntegerBytes)?;
+        i |= (u64::from(buf[0] & 0x7F)) << (j * 7);
+        if (buf[0] >> 7) == 0 {
+            break;
+        } else {
+            j += 1;
+        }
+    }
+
+    Ok(u64::from_le(i))
+}
 
 #[inline]
 pub(crate) fn decode_long<R: Read>(reader: &mut R) -> AvroResult<Value> {
@@ -352,7 +399,7 @@ mod tests {
     use crate::schema::{InnerDecimalSchema, UuidSchema};
     use crate::{
         Decimal,
-        decode::decode,
+        decode::{decode, decode_variable},
         encode::{encode, tests::success},
         schema::{DecimalSchema, FixedSchema, Schema},
         types::{
@@ -364,6 +411,17 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::collections::HashMap;
     use uuid::Uuid;
+
+    #[test]
+    fn test_decode_variable_overflow() {
+        let causes_left_shift_overflow: &[u8] = &[0xe1; 10];
+        assert!(matches!(
+            decode_variable(&mut &*causes_left_shift_overflow)
+                .unwrap_err()
+                .details(),
+            Details::IntegerOverflow
+        ));
+    }
 
     #[test]
     fn test_decode_array_without_size() -> TestResult {
