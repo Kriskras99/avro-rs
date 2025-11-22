@@ -18,7 +18,7 @@
 //! Logic handling reading from Avro format at user level.
 use crate::{
     AvroResult, Codec, Error,
-    decode::{decode, decode_internal},
+    decode::{decode, decode_internal, read_long},
     error::Details,
     from_value,
     headers::{HeaderBuilder, RabinFingerprintHeader},
@@ -140,10 +140,10 @@ impl<'r, R: Read> Block<'r, R> {
     /// the block. The objects are stored in an internal buffer to the `Reader`.
     fn read_block_next(&mut self) -> AvroResult<()> {
         assert!(self.is_empty(), "Expected self to be empty!");
-        match util::read_long(&mut self.reader).map_err(Error::into_details) {
+        match read_long(&mut self.reader).map_err(Error::into_details) {
             Ok(block_len) => {
                 self.message_count = block_len as usize;
-                let block_bytes = util::read_long(&mut self.reader)?;
+                let block_bytes = read_long(&mut self.reader)?;
                 self.fill_buf(block_bytes as usize)?;
                 let mut marker = [0u8; 16];
                 self.reader
