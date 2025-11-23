@@ -1,0 +1,4 @@
+# This only works on nightly but is very useful when writing lots of code.
+# TODO: Remove before merge
+imports_granularity="Crate"
+

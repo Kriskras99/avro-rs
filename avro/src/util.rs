@@ -83,6 +83,68 @@ pub(crate) fn is_human_readable() -> bool {
     *SERDE_HUMAN_READABLE.get_or_init(|| DEFAULT_SERDE_HUMAN_READABLE)
 }
 
+/// Utilities for working with low-level parts of the library like [`encode`] and [`decode`].
+///
+/// [`encode`]: crate::encode
+/// [`decode`]: crate::decode
+pub mod low_level {
+    use crate::Error;
+    use oval::Buffer;
+
+    /// A trait for the lifecycle of a finite state machine.
+    pub trait Fsm: Sized {
+        /// The final output of the state machine.
+        type Output: Sized;
+
+        /// Start/continue the state machine.
+        ///
+        /// Implementers are not allowed to return until they can't make progress anymore.
+        fn parse(self, buffer: &mut Buffer) -> FsmResult<Self, Self::Output>;
+    }
+
+    /// Indicates whether the state machine has completed or needs to be polled again.
+    #[must_use]
+    pub enum FsmControlFlow<Fsm, Output> {
+        /// The state machine needs more data before it can continue.
+        NeedMore(Fsm),
+        /// The state machine is done and the result is returned.
+        Done(Output),
+    }
+
+    impl<FSM1, O1> FsmControlFlow<FSM1, O1> {
+        /// Map a state machine to another state machine.
+        ///
+        /// This function will only execute `need_more` or `done`, not both.
+        pub fn map<F1, F2, FSM2, O2>(self, need_more: F1, done: F2) -> FsmControlFlow<FSM2, O2>
+        where
+            F1: FnOnce(FSM1) -> FSM2,
+            F2: FnOnce(O1) -> O2,
+        {
+            match self {
+                FsmControlFlow::NeedMore(fsm) => FsmControlFlow::NeedMore(need_more(fsm)),
+                FsmControlFlow::Done(fsm) => FsmControlFlow::Done(done(fsm)),
+            }
+        }
+
+        /// Map a state machine to another state machine with fallible conversions.
+        ///
+        /// This function will only execute `need_more` or `done`, not both.
+        pub fn map_fallible<F1, F2, FSM2, O2>(self, need_more: F1, done: F2) -> FsmResult<FSM2, O2>
+        where
+            F1: FnOnce(FSM1) -> Result<FSM2, Error>,
+            F2: FnOnce(O1) -> Result<O2, Error>,
+        {
+            match self {
+                FsmControlFlow::NeedMore(fsm) => Ok(FsmControlFlow::NeedMore(need_more(fsm)?)),
+                FsmControlFlow::Done(fsm) => Ok(FsmControlFlow::Done(done(fsm)?)),
+            }
+        }
+    }
+
+    /// The result of an execution of a state machine.
+    pub type FsmResult<Fsm, Output> = Result<FsmControlFlow<Fsm, Output>, Error>;
+}
+
 pub(crate) trait MapHelper {
     fn string(&self, key: &str) -> Option<String>;
 

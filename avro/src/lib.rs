@@ -947,14 +947,14 @@ mod bytes;
 mod codec;
 mod de;
 mod decimal;
-mod decode;
 mod duration;
-mod encode;
 mod reader;
 mod ser;
 mod ser_schema;
 mod writer;
 
+pub mod decode;
+pub mod encode;
 pub mod error;
 pub mod headers;
 pub mod rabin;

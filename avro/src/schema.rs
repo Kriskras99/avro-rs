@@ -41,6 +41,7 @@ use std::{
     hash::Hash,
     io::Read,
     str::FromStr,
+    sync::LazyLock,
 };
 use strum_macros::{Display, EnumDiscriminants, EnumString};
 
@@ -243,6 +244,10 @@ pub type Aliases = Option<Vec<Alias>>;
 pub(crate) type Names = HashMap<Name, Schema>;
 /// Represents Schema lookup within a schema
 pub type NamesRef<'a> = HashMap<Name, &'a Schema>;
+/// An always empty [`NamesRef`].
+///
+/// Useful if you have to provide a `&NamesRef` to something that lives longer than your current scope.
+pub static EMPTY_NAMES_REF: LazyLock<NamesRef<'static>> = LazyLock::new(HashMap::new);
 /// Represents the namespace for Named Schema
 pub type Namespace = Option<String>;
 
@@ -532,37 +537,38 @@ impl<'s> ResolvedSchema<'s> {
     }
 }
 
+#[ouroboros::self_referencing]
 pub(crate) struct ResolvedOwnedSchema {
-    names: Names,
     root_schema: Schema,
+    #[borrows(root_schema)]
+    #[covariant]
+    names: NamesRef<'this>,
 }
 
 impl TryFrom<Schema> for ResolvedOwnedSchema {
     type Error = Error;
 
     fn try_from(schema: Schema) -> AvroResult<Self> {
-        let names = HashMap::new();
-        let mut rs = ResolvedOwnedSchema {
-            names,
-            root_schema: schema,
-        };
-        resolve_names(&rs.root_schema, &mut rs.names, &None)?;
-        Ok(rs)
+        Self::try_new(schema, |schema| {
+            let mut names = HashMap::new();
+            resolve_names(schema, &mut names, &None)?;
+            Ok(names)
+        })
     }
 }
 
 impl ResolvedOwnedSchema {
     pub(crate) fn get_root_schema(&self) -> &Schema {
-        &self.root_schema
+        self.borrow_root_schema()
     }
-    pub(crate) fn get_names(&self) -> &Names {
-        &self.names
+    pub(crate) fn get_names(&self) -> &NamesRef<'_> {
+        self.borrow_names()
     }
 }
 
-pub(crate) fn resolve_names(
-    schema: &Schema,
-    names: &mut Names,
+pub(crate) fn resolve_names<'a>(
+    schema: &'a Schema,
+    names: &mut NamesRef<'a>,
     enclosing_namespace: &Namespace,
 ) -> AvroResult<()> {
     match schema {
@@ -576,10 +582,7 @@ pub(crate) fn resolve_names(
         }
         Schema::Enum(EnumSchema { name, .. }) | Schema::Fixed(FixedSchema { name, .. }) => {
             let fully_qualified_name = name.fully_qualified_name(enclosing_namespace);
-            if names
-                .insert(fully_qualified_name.clone(), schema.clone())
-                .is_some()
-            {
+            if names.insert(fully_qualified_name.clone(), schema).is_some() {
                 Err(Details::AmbiguousSchemaDefinition(fully_qualified_name).into())
             } else {
                 Ok(())
@@ -587,10 +590,7 @@ pub(crate) fn resolve_names(
         }
         Schema::Record(RecordSchema { name, fields, .. }) => {
             let fully_qualified_name = name.fully_qualified_name(enclosing_namespace);
-            if names
-                .insert(fully_qualified_name.clone(), schema.clone())
-                .is_some()
-            {
+            if names.insert(fully_qualified_name.clone(), schema).is_some() {
                 Err(Details::AmbiguousSchemaDefinition(fully_qualified_name).into())
             } else {
                 let record_namespace = fully_qualified_name.namespace;
@@ -611,13 +611,13 @@ pub(crate) fn resolve_names(
     }
 }
 
-pub(crate) fn resolve_names_with_schemata(
-    schemata: impl IntoIterator<Item = impl Borrow<Schema>>,
-    names: &mut Names,
+pub(crate) fn resolve_names_with_schemata<'a>(
+    schemata: impl IntoIterator<Item = &'a Schema>,
+    names: &mut NamesRef<'a>,
     enclosing_namespace: &Namespace,
 ) -> AvroResult<()> {
     for schema in schemata {
-        resolve_names(schema.borrow(), names, enclosing_namespace)?;
+        resolve_names(schema, names, enclosing_namespace)?;
     }
     Ok(())
 }
