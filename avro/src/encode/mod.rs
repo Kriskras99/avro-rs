@@ -15,14 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::schema::{InnerDecimalSchema, UuidSchema};
 use crate::{
     AvroResult,
     bigdecimal::serialize_big_decimal,
     error::Details,
     schema::{
-        DecimalSchema, EnumSchema, FixedSchema, Name, Namespace, RecordSchema, ResolvedSchema,
-        Schema, SchemaKind, UnionSchema,
+        DecimalSchema, EnumSchema, FixedSchema, InnerDecimalSchema, Name, Namespace, RecordSchema,
+        ResolvedSchema, Schema, SchemaKind, UnionSchema, UuidSchema,
     },
     types::{Value, ValueKind},
 };

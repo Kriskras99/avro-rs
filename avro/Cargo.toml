@@ -73,6 +73,8 @@ thiserror = { default-features = false, version = "2.0.17" }
 uuid = { default-features = false, version = "1.19.0", features = ["serde", "std"] }
 liblzma = { default-features = false, version = "0.4.5", optional = true }
 zstd = { default-features = false, version = "0.13.3", optional = true }
+oval = { version = "2.0.0", default-features = false }
+ouroboros = { version = "0.18.5", default-features = false, features = ["std"] }
 
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

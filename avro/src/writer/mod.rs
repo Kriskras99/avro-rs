@@ -789,8 +789,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use uuid::Uuid;
 
-    use crate::schema::InnerDecimalSchema;
-    use crate::{codec::DeflateSettings, error::Details};
+    use crate::{codec::DeflateSettings, error::Details, schema::InnerDecimalSchema};
     use apache_avro_test_helper::TestResult;
 
     const AVRO_OBJECT_HEADER_LEN: usize = AVRO_OBJECT_HEADER.len();

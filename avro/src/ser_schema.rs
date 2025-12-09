@@ -18,12 +18,14 @@
 //! Logic for serde-compatible schema-aware serialization
 //! which writes directly to a `Write` stream
 
-use crate::schema::{InnerDecimalSchema, UuidSchema};
 use crate::{
     bigdecimal::big_decimal_as_bytes,
     encode::{encode_int, encode_long},
     error::{Details, Error},
-    schema::{Name, NamesRef, Namespace, RecordField, RecordSchema, Schema},
+    schema::{
+        InnerDecimalSchema, Name, NamesRef, Namespace, RecordField, RecordSchema, Schema,
+        UuidSchema,
+    },
 };
 use bigdecimal::BigDecimal;
 use serde::ser;

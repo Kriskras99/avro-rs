@@ -17,302 +17,74 @@
 
 //! Logic handling reading from Avro format at user level.
 use crate::{
-    AvroResult, Codec, Error,
-    decode::{decode, decode_internal, read_long},
+    AvroResult, Error,
+    decode::{
+        DatumFsm,
+        object_container::{Header, ObjectContainerFsm, ReadingDataBlock},
+    },
     error::Details,
     from_value,
     headers::{HeaderBuilder, RabinFingerprintHeader},
-    schema::{
-        AvroSchema, Names, ResolvedOwnedSchema, ResolvedSchema, Schema, resolve_names,
-        resolve_names_with_schemata,
-    },
+    schema::{AvroSchema, ResolvedOwnedSchema, ResolvedSchema, Schema},
     types::Value,
-    util,
+    util::low_level::{Fsm, FsmControlFlow},
 };
-use log::warn;
+use oval::Buffer;
 use serde::de::DeserializeOwned;
-use serde_json::from_slice;
 use std::{
     collections::HashMap,
     io::{ErrorKind, Read},
     marker::PhantomData,
-    str::FromStr,
 };
 
-/// Internal Block reader.
-#[derive(Debug, Clone)]
-struct Block<'r, R> {
-    reader: R,
-    /// Internal buffering to reduce allocation.
-    buf: Vec<u8>,
-    buf_idx: usize,
-    /// Number of elements expected to exist within this block.
-    message_count: usize,
-    marker: [u8; 16],
-    codec: Codec,
-    writer_schema: Schema,
-    schemata: Vec<&'r Schema>,
-    user_metadata: HashMap<String, Vec<u8>>,
-    names_refs: Names,
-}
-
-impl<'r, R: Read> Block<'r, R> {
-    fn new(reader: R, schemata: Vec<&'r Schema>) -> AvroResult<Block<'r, R>> {
-        let mut block = Block {
-            reader,
-            codec: Codec::Null,
-            writer_schema: Schema::Null,
-            schemata,
-            buf: vec![],
-            buf_idx: 0,
-            message_count: 0,
-            marker: [0; 16],
-            user_metadata: Default::default(),
-            names_refs: Default::default(),
-        };
-
-        block.read_header()?;
-        Ok(block)
-    }
-
-    /// Try to read the header and to set the writer `Schema`, the `Codec` and the marker based on
-    /// its content.
-    fn read_header(&mut self) -> AvroResult<()> {
-        let mut buf = [0u8; 4];
-        self.reader
-            .read_exact(&mut buf)
-            .map_err(Details::ReadHeader)?;
-
-        if buf != [b'O', b'b', b'j', 1u8] {
-            return Err(Details::HeaderMagic.into());
-        }
-
-        let meta_schema = Schema::map(Schema::Bytes);
-        match decode(&meta_schema, &mut self.reader)? {
-            Value::Map(metadata) => {
-                self.read_writer_schema(&metadata)?;
-                self.codec = read_codec(&metadata)?;
-
-                for (key, value) in metadata {
-                    if key == "avro.schema"
-                        || key == "avro.codec"
-                        || key == "avro.codec.compression_level"
-                    {
-                        // already processed
-                    } else if key.starts_with("avro.") {
-                        warn!("Ignoring unknown metadata key: {key}");
-                    } else {
-                        self.read_user_metadata(key, value);
-                    }
-                }
-            }
-            _ => {
-                return Err(Details::GetHeaderMetadata.into());
-            }
-        }
-
-        self.reader
-            .read_exact(&mut self.marker)
-            .map_err(|e| Details::ReadMarker(e).into())
-    }
-
-    fn fill_buf(&mut self, n: usize) -> AvroResult<()> {
-        // The buffer needs to contain exactly `n` elements, otherwise codecs will potentially read
-        // invalid bytes.
-        //
-        // The are two cases to handle here:
-        //
-        // 1. `n > self.buf.len()`:
-        //    In this case we call `Vec::resize`, which guarantees that `self.buf.len() == n`.
-        // 2. `n < self.buf.len()`:
-        //    We need to resize to ensure that the buffer len is safe to read `n` elements.
-        //
-        // TODO: Figure out a way to avoid having to truncate for the second case.
-        self.buf.resize(util::safe_len(n)?, 0);
-        self.reader
-            .read_exact(&mut self.buf)
-            .map_err(Details::ReadIntoBuf)?;
-        self.buf_idx = 0;
+fn fill_buffer(reader: &mut impl Read, buffer: &mut Buffer) -> Result<(), Error> {
+    let bytes_read = reader.read(buffer.space()).map_err(Details::ReadBytes)?;
+    buffer.fill(bytes_read);
+    if bytes_read == 0 {
+        Err(Error::new(Details::ReadBytes(std::io::Error::from(
+            std::io::ErrorKind::UnexpectedEof,
+        ))))
+    } else {
         Ok(())
     }
+}
 
-    /// Try to read a data block, also performing schema resolution for the objects contained in
-    /// the block. The objects are stored in an internal buffer to the `Reader`.
-    fn read_block_next(&mut self) -> AvroResult<()> {
-        assert!(self.is_empty(), "Expected self to be empty!");
-        match read_long(&mut self.reader).map_err(Error::into_details) {
-            Ok(block_len) => {
-                self.message_count = block_len as usize;
-                let block_bytes = read_long(&mut self.reader)?;
-                self.fill_buf(block_bytes as usize)?;
-                let mut marker = [0u8; 16];
-                self.reader
-                    .read_exact(&mut marker)
-                    .map_err(Details::ReadBlockMarker)?;
+enum FsmOrHeader<'a> {
+    Fsm(ObjectContainerFsm<'a, ReadingDataBlock>),
+    Header(Header<'a>),
+    /// This should only be used during function calls to be able to take the fsm.
+    ///
+    /// *Never* save this value into the reader.
+    Empty,
+}
 
-                if marker != self.marker {
-                    return Err(Details::GetBlockMarker.into());
-                }
-
-                // NOTE (JAB): This doesn't fit this Reader pattern very well.
-                // `self.buf` is a growable buffer that is reused as the reader is iterated.
-                // For non `Codec::Null` variants, `decompress` will allocate a new `Vec`
-                // and replace `buf` with the new one, instead of reusing the same buffer.
-                // We can address this by using some "limited read" type to decode directly
-                // into the buffer. But this is fine, for now.
-                self.codec.decompress(&mut self.buf)
-            }
-            Err(Details::ReadVariableIntegerBytes(io_err)) => {
-                if let ErrorKind::UnexpectedEof = io_err.kind() {
-                    // to not return any error in case we only finished to read cleanly from the stream
-                    Ok(())
-                } else {
-                    Err(Details::ReadVariableIntegerBytes(io_err).into())
-                }
-            }
-            Err(e) => Err(Error::new(e)),
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.message_count
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    fn read_next(&mut self, read_schema: Option<&Schema>) -> AvroResult<Option<Value>> {
-        if self.is_empty() {
-            self.read_block_next()?;
-            if self.is_empty() {
-                return Ok(None);
+impl<'a> FsmOrHeader<'a> {
+    pub fn header(&self) -> &Header<'_> {
+        match self {
+            FsmOrHeader::Fsm(fsm) => fsm.header(),
+            FsmOrHeader::Header(header) => header,
+            FsmOrHeader::Empty => {
+                unreachable!("`Self::Empty` should never exist when the user has access to `self`")
             }
         }
-
-        let mut block_bytes = &self.buf[self.buf_idx..];
-        let b_original = block_bytes.len();
-
-        let item = decode_internal(
-            &self.writer_schema,
-            &self.names_refs,
-            &None,
-            &mut block_bytes,
-        )?;
-        let item = match read_schema {
-            Some(schema) => item.resolve(schema)?,
-            None => item,
-        };
-
-        if b_original != 0 && b_original == block_bytes.len() {
-            // from_avro_datum did not consume any bytes, so return an error to avoid an infinite loop
-            return Err(Details::ReadBlock.into());
-        }
-        self.buf_idx += b_original - block_bytes.len();
-        self.message_count -= 1;
-        Ok(Some(item))
     }
 
-    fn read_writer_schema(&mut self, metadata: &HashMap<String, Value>) -> AvroResult<()> {
-        let json: serde_json::Value = metadata
-            .get("avro.schema")
-            .and_then(|bytes| {
-                if let Value::Bytes(ref bytes) = *bytes {
-                    from_slice(bytes.as_ref()).ok()
-                } else {
-                    None
-                }
-            })
-            .ok_or(Details::GetAvroSchemaFromMap)?;
-        if !self.schemata.is_empty() {
-            let rs = ResolvedSchema::try_from(self.schemata.clone())?;
-            let names: Names = rs
-                .get_names()
-                .iter()
-                .map(|(name, schema)| (name.clone(), (*schema).clone()))
-                .collect();
-            self.writer_schema = Schema::parse_with_names(&json, names)?;
-            resolve_names_with_schemata(
-                self.schemata.iter().copied(),
-                &mut self.names_refs,
-                &None,
-            )?;
+    /// Tqke the [`Fsm`] and replace it with [`Empty`].
+    ///
+    /// This must always be replaced in the same function if `take()` returns [`Some`].
+    ///
+    /// [`Fsm`]: Self::Fsm
+    /// [`Empty`]: Self::Empty
+    fn take(&mut self) -> Option<ObjectContainerFsm<'a, ReadingDataBlock>> {
+        if matches!(self, Self::Fsm(_)) {
+            let Self::Fsm(fsm) = std::mem::replace(self, Self::Empty) else {
+                unreachable!("The matches! above checked that `self` is the type `Self::Fsm`")
+            };
+            Some(fsm)
         } else {
-            self.writer_schema = Schema::parse(&json)?;
-            resolve_names(&self.writer_schema, &mut self.names_refs, &None)?;
-        }
-        Ok(())
-    }
-
-    fn read_user_metadata(&mut self, key: String, value: Value) {
-        match value {
-            Value::Bytes(ref vec) => {
-                self.user_metadata.insert(key, vec.clone());
-            }
-            wrong => {
-                warn!("User metadata values must be Value::Bytes, found {wrong:?}");
-            }
+            None
         }
     }
-}
-
-fn read_codec(metadata: &HashMap<String, Value>) -> AvroResult<Codec> {
-    let result = metadata
-        .get("avro.codec")
-        .map(|codec| {
-            if let Value::Bytes(ref bytes) = *codec {
-                match std::str::from_utf8(bytes.as_ref()) {
-                    Ok(utf8) => Ok(utf8),
-                    Err(utf8_error) => Err(Details::ConvertToUtf8Error(utf8_error).into()),
-                }
-            } else {
-                Err(Details::BadCodecMetadata.into())
-            }
-        })
-        .map(|codec_res| match codec_res {
-            Ok(codec) => match Codec::from_str(codec) {
-                Ok(codec) => match codec {
-                    #[cfg(feature = "bzip")]
-                    Codec::Bzip2(_) => {
-                        use crate::Bzip2Settings;
-                        if let Some(Value::Bytes(bytes)) =
-                            metadata.get("avro.codec.compression_level")
-                        {
-                            Ok(Codec::Bzip2(Bzip2Settings::new(bytes[0])))
-                        } else {
-                            Ok(codec)
-                        }
-                    }
-                    #[cfg(feature = "xz")]
-                    Codec::Xz(_) => {
-                        use crate::XzSettings;
-                        if let Some(Value::Bytes(bytes)) =
-                            metadata.get("avro.codec.compression_level")
-                        {
-                            Ok(Codec::Xz(XzSettings::new(bytes[0])))
-                        } else {
-                            Ok(codec)
-                        }
-                    }
-                    #[cfg(feature = "zstandard")]
-                    Codec::Zstandard(_) => {
-                        use crate::ZstandardSettings;
-                        if let Some(Value::Bytes(bytes)) =
-                            metadata.get("avro.codec.compression_level")
-                        {
-                            Ok(Codec::Zstandard(ZstandardSettings::new(bytes[0])))
-                        } else {
-                            Ok(codec)
-                        }
-                    }
-                    _ => Ok(codec),
-                },
-                Err(_) => Err(Details::CodecNotSupported(codec.to_owned()).into()),
-            },
-            Err(err) => Err(err),
-        });
-
-    result.unwrap_or(Ok(Codec::Null))
 }
 
 /// Main interface for reading Avro formatted values.
@@ -331,26 +103,49 @@ fn read_codec(metadata: &HashMap<String, Value>) -> AvroResult<Codec> {
 /// }
 /// ```
 pub struct Reader<'a, R> {
-    block: Block<'a, R>,
+    fsm: FsmOrHeader<'a>,
+    reader: R,
+    buffer: Buffer,
     reader_schema: Option<&'a Schema>,
     errored: bool,
     should_resolve_schema: bool,
 }
 
 impl<'a, R: Read> Reader<'a, R> {
+    fn new_inner(
+        reader_schema: Option<&'a Schema>,
+        schemata: Vec<&'a Schema>,
+        mut reader: R,
+    ) -> AvroResult<Self> {
+        let mut fsm = ObjectContainerFsm::new(schemata);
+        // TODO: Make this size configurable, using builder?
+        let mut buffer = Buffer::with_capacity(2048);
+        loop {
+            fill_buffer(&mut reader, &mut buffer)?;
+            match fsm.parse(&mut buffer)? {
+                FsmControlFlow::NeedMore(new_fsm) => fsm = new_fsm,
+                FsmControlFlow::Done(new_fsm) => {
+                    // Check if the reader and writer schemas disagree.
+                    let should_resolve_schema = Some(new_fsm.header().schema()) != reader_schema;
+                    return Ok(Self {
+                        fsm: FsmOrHeader::Fsm(new_fsm),
+                        reader,
+                        buffer,
+                        reader_schema,
+                        errored: false,
+                        should_resolve_schema,
+                    });
+                }
+            }
+        }
+    }
+
     /// Creates a `Reader` given something implementing the `io::Read` trait to read from.
     /// No reader `Schema` will be set.
     ///
     /// **NOTE** The avro header is going to be read automatically upon creation of the `Reader`.
     pub fn new(reader: R) -> AvroResult<Reader<'a, R>> {
-        let block = Block::new(reader, vec![])?;
-        let reader = Reader {
-            block,
-            reader_schema: None,
-            errored: false,
-            should_resolve_schema: false,
-        };
-        Ok(reader)
+        Self::new_inner(None, Vec::new(), reader)
     }
 
     /// Creates a `Reader` given a reader `Schema` and something implementing the `io::Read` trait
@@ -358,16 +153,7 @@ impl<'a, R: Read> Reader<'a, R> {
     ///
     /// **NOTE** The avro header is going to be read automatically upon creation of the `Reader`.
     pub fn with_schema(schema: &'a Schema, reader: R) -> AvroResult<Reader<'a, R>> {
-        let block = Block::new(reader, vec![schema])?;
-        let mut reader = Reader {
-            block,
-            reader_schema: Some(schema),
-            errored: false,
-            should_resolve_schema: false,
-        };
-        // Check if the reader and writer schemas disagree.
-        reader.should_resolve_schema = reader.writer_schema() != schema;
-        Ok(reader)
+        Self::new_inner(Some(schema), vec![schema], reader)
     }
 
     /// Creates a `Reader` given a reader `Schema` and something implementing the `io::Read` trait
@@ -379,22 +165,13 @@ impl<'a, R: Read> Reader<'a, R> {
         schemata: Vec<&'a Schema>,
         reader: R,
     ) -> AvroResult<Reader<'a, R>> {
-        let block = Block::new(reader, schemata)?;
-        let mut reader = Reader {
-            block,
-            reader_schema: Some(schema),
-            errored: false,
-            should_resolve_schema: false,
-        };
-        // Check if the reader and writer schemas disagree.
-        reader.should_resolve_schema = reader.writer_schema() != schema;
-        Ok(reader)
+        Self::new_inner(Some(schema), schemata, reader)
     }
 
     /// Get a reference to the writer `Schema`.
     #[inline]
     pub fn writer_schema(&self) -> &Schema {
-        &self.block.writer_schema
+        self.fsm.header().schema()
     }
 
     /// Get a reference to the optional reader `Schema`.
@@ -406,18 +183,47 @@ impl<'a, R: Read> Reader<'a, R> {
     /// Get a reference to the user metadata
     #[inline]
     pub fn user_metadata(&self) -> &HashMap<String, Vec<u8>> {
-        &self.block.user_metadata
+        self.fsm.header().metadata()
     }
 
     #[inline]
     fn read_next(&mut self) -> AvroResult<Option<Value>> {
-        let read_schema = if self.should_resolve_schema {
-            self.reader_schema
-        } else {
-            None
+        // self.fsm must always be replaced in the same function if take() returns Some()
+        let Some(mut fsm) = self.fsm.take() else {
+            // Already finished
+            return Ok(None);
+        };
+        let mut item = loop {
+            match fsm.parse(&mut self.buffer)? {
+                FsmControlFlow::NeedMore(new_fsm) => {
+                    fsm = new_fsm;
+                }
+                FsmControlFlow::Done((value, fsm)) => {
+                    self.fsm = FsmOrHeader::Fsm(fsm);
+                    break value;
+                }
+            }
+            if let Err(error) = fill_buffer(&mut self.reader, &mut self.buffer) {
+                let Details::ReadBytes(details) = error.details() else {
+                    unreachable!("fill_buffer can only return Details::ReadBytes")
+                };
+                if details.kind() == ErrorKind::UnexpectedEof && fsm.buffer_empty_at_block_border()
+                {
+                    // We ran out of bytes at exactly the block border, thus we finished decoding
+                    self.fsm = FsmOrHeader::Header(fsm.into_header());
+                    return Ok(None);
+                } else {
+                    return Err(error);
+                }
+            }
         };
 
-        self.block.read_next(read_schema)
+        if self.should_resolve_schema {
+            if let Some(reader_schema) = self.reader_schema {
+                item = item.resolve(reader_schema)?;
+            }
+        }
+        Ok(Some(item))
     }
 }
 
@@ -452,7 +258,20 @@ pub fn from_avro_datum<R: Read>(
     reader: &mut R,
     reader_schema: Option<&Schema>,
 ) -> AvroResult<Value> {
-    let value = decode(writer_schema, reader)?;
+    let mut buffer = Buffer::with_capacity(1024);
+    let resolved = ResolvedSchema::try_from(writer_schema)?;
+    let mut fsm = DatumFsm::new(writer_schema, resolved.get_names())?;
+    let value = loop {
+        match fsm.parse(&mut buffer)? {
+            FsmControlFlow::NeedMore(new_fsm) => {
+                fsm = new_fsm;
+            }
+            FsmControlFlow::Done(value) => {
+                break value;
+            }
+        }
+        fill_buffer(reader, &mut buffer)?;
+    };
     match reader_schema {
         Some(schema) => value.resolve(schema),
         None => Ok(value),
@@ -494,7 +313,19 @@ pub fn from_avro_datum_reader_schemata<R: Read>(
     reader_schemata: Vec<&Schema>,
 ) -> AvroResult<Value> {
     let rs = ResolvedSchema::try_from(writer_schemata)?;
-    let value = decode_internal(writer_schema, rs.get_names(), &None, reader)?;
+    let mut buffer = Buffer::with_capacity(1024);
+    let mut fsm = DatumFsm::new(writer_schema, rs.get_names())?;
+    let value = loop {
+        match fsm.parse(&mut buffer)? {
+            FsmControlFlow::NeedMore(new_fsm) => {
+                fsm = new_fsm;
+            }
+            FsmControlFlow::Done(value) => {
+                break value;
+            }
+        }
+        fill_buffer(reader, &mut buffer)?;
+    };
     match reader_schema {
         Some(schema) => {
             if reader_schemata.is_empty() {
@@ -530,24 +361,40 @@ impl GenericSingleObjectReader {
     }
 
     pub fn read_value<R: Read>(&self, reader: &mut R) -> AvroResult<Value> {
-        let mut header = vec![0; self.expected_header.len()];
-        match reader.read_exact(&mut header) {
-            Ok(_) => {
-                if self.expected_header == header {
-                    decode_internal(
-                        self.write_schema.get_root_schema(),
-                        self.write_schema.get_names(),
-                        &None,
-                        reader,
-                    )
-                } else {
-                    Err(
-                        Details::SingleObjectHeaderMismatch(self.expected_header.clone(), header)
-                            .into(),
-                    )
+        let header_len = self.expected_header.len();
+        // TODO: Should read_value take &mut instead so we can reuse the buffer between calls?
+        let mut buffer = Buffer::with_capacity(1024.max(header_len));
+
+        // Make sure there are at least `header_len` bytes in the buffer before we do the comparison.
+        // We don't use `read_exact` here, as most likely `read` will read more than `read_exact` would
+        // which might allow the entire object to be read at once.
+        while buffer.available_data() < header_len {
+            fill_buffer(reader, &mut buffer)?;
+        }
+
+        if buffer.data()[0..header_len] == self.expected_header {
+            buffer.consume(header_len);
+            let mut fsm = DatumFsm::new(
+                self.write_schema.get_root_schema(),
+                self.write_schema.get_names(),
+            )?;
+            loop {
+                match fsm.parse(&mut buffer)? {
+                    FsmControlFlow::NeedMore(new_fsm) => {
+                        fsm = new_fsm;
+                    }
+                    FsmControlFlow::Done(value) => {
+                        return Ok(value);
+                    }
                 }
+                fill_buffer(reader, &mut buffer)?;
             }
-            Err(io_error) => Err(Details::ReadHeader(io_error).into()),
+        } else {
+            Err(Details::SingleObjectHeaderMismatch(
+                self.expected_header.clone(),
+                buffer.data().to_vec(),
+            )
+            .into())
         }
     }
 }
@@ -604,7 +451,10 @@ pub fn read_marker(bytes: &[u8]) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{encode::encode, headers::GlueSchemaUuidHeader, rabin::Rabin, types::Record};
+    use crate::{
+        Error, encode::encode, error::Details, headers::GlueSchemaUuidHeader, rabin::Rabin,
+        types::Record,
+    };
     use apache_avro_test_helper::TestResult;
     use pretty_assertions::assert_eq;
     use serde::Deserialize;
@@ -661,8 +511,15 @@ mod tests {
         Ok(())
     }
 
+    // This test was originally introduced because of AVRO-3240, where a user
+    // was reading with a different schema than the writer. The read schema had
+    // some extra Union<Null, T> fields, the user expected to still be able to read
+    // with that schema directly. This is wrong, there exist no bytes in the encoded
+    // data that can be decoded by the Union fields. Instead the user should read with
+    // the original schema and then resolve the value with the new schema.
+    // The test has been reworked to test that the original setup fails.
     #[test]
-    fn test_from_avro_datum_with_union_to_struct() -> TestResult {
+    fn test_avro_3240_from_avro_datum_with_union_to_struct() -> TestResult {
         const TEST_RECORD_SCHEMA_3240: &str = r#"
     {
       "type": "record",
@@ -695,35 +552,10 @@ mod tests {
       ]
     }
     "#;
-        #[derive(Default, Debug, Deserialize, PartialEq, Eq)]
-        struct TestRecord3240 {
-            a: i64,
-            b: String,
-            a_nullable_array: Option<Vec<String>>,
-            // we are missing the 'a_nullable_boolean' field to simulate missing keys
-            // a_nullable_boolean: Option<bool>,
-            a_nullable_string: Option<String>,
-        }
-
         let schema = Schema::parse_str(TEST_RECORD_SCHEMA_3240)?;
         let mut encoded: &'static [u8] = &[54, 6, 102, 111, 111];
 
-        let expected_record: TestRecord3240 = TestRecord3240 {
-            a: 27i64,
-            b: String::from("foo"),
-            a_nullable_array: None,
-            a_nullable_string: None,
-        };
-
-        let avro_datum = from_avro_datum(&schema, &mut encoded, None)?;
-        let parsed_record: TestRecord3240 = match &avro_datum {
-            Value::Record(_) => from_value::<TestRecord3240>(&avro_datum)?,
-            unexpected => {
-                panic!("could not map avro data to struct, found unexpected: {unexpected:?}")
-            }
-        };
-
-        assert_eq!(parsed_record, expected_record);
+        from_avro_datum(&schema, &mut encoded, None).unwrap_err();
 
         Ok(())
     }
@@ -775,12 +607,12 @@ mod tests {
     #[test]
     fn test_reader_invalid_block() -> TestResult {
         let schema = Schema::parse_str(SCHEMA)?;
-        let mut invalid = &ENCODED[0..ENCODED.len() - 19];
-        let reader = Reader::with_schema(&schema, &mut invalid)?;
-        for value in reader {
-            assert!(value.is_err());
-        }
-
+        let invalid = ENCODED[0..ENCODED.len() - 19].to_vec();
+        let mut reader = Reader::with_schema(&schema, &invalid[..])?;
+        // First value is not corrupt
+        reader.next().unwrap().unwrap();
+        // Second value is corrupt
+        assert!(reader.next().unwrap().is_err());
         Ok(())
     }
 
