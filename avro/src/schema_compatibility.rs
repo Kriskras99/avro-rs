@@ -16,10 +16,9 @@
 // under the License.
 
 //! Logic for checking schema compatibility
-use crate::schema::UuidSchema;
 use crate::{
     error::CompatibilityError,
-    schema::{EnumSchema, FixedSchema, RecordSchema, Schema, SchemaKind},
+    schema::{EnumSchema, FixedSchema, RecordSchema, Schema, SchemaKind, UuidSchema},
 };
 use std::{
     collections::{HashSet, hash_map::DefaultHasher},
@@ -599,9 +598,9 @@ impl SchemaCompatibility {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{Name, UuidSchema};
     use crate::{
         Codec, Reader, Writer,
+        schema::{Name, UuidSchema},
         types::{Record, Value},
     };
     use apache_avro_test_helper::TestResult;

@@ -15,12 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::schema::{InnerDecimalSchema, UuidSchema};
 use crate::{
     Schema,
     schema::{
-        ArraySchema, DecimalSchema, EnumSchema, FixedSchema, MapSchema, RecordField, RecordSchema,
-        UnionSchema,
+        ArraySchema, DecimalSchema, EnumSchema, FixedSchema, InnerDecimalSchema, MapSchema,
+        RecordField, RecordSchema, UnionSchema, UuidSchema,
     },
 };
 use log::debug;

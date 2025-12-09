@@ -16,7 +16,6 @@
 // under the License.
 
 //! Logic handling the intermediate representation of Avro values.
-use crate::schema::{InnerDecimalSchema, UuidSchema};
 use crate::{
     AvroResult, Error,
     bigdecimal::{deserialize_big_decimal, serialize_big_decimal},
@@ -24,8 +23,9 @@ use crate::{
     duration::Duration,
     error::Details,
     schema::{
-        DecimalSchema, EnumSchema, FixedSchema, Name, Namespace, Precision, RecordField,
-        RecordSchema, ResolvedSchema, Scale, Schema, SchemaKind, UnionSchema,
+        DecimalSchema, EnumSchema, FixedSchema, InnerDecimalSchema, Name, Namespace, Precision,
+        RecordField, RecordSchema, ResolvedSchema, Scale, Schema, SchemaKind, UnionSchema,
+        UuidSchema,
     },
 };
 use bigdecimal::BigDecimal;
@@ -182,6 +182,7 @@ where
 {
     fn from(value: Option<T>) -> Self {
         // FIXME: this is incorrect in case first type in union is not "none"
+        // TODO: This should be deprecated and repace with a function that also takes a schemas
         Self::Union(
             value.is_some() as u32,
             Box::new(value.map_or_else(|| Self::Null, Into::into)),
