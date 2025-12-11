@@ -15,305 +15,330 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Low-level decoders for binary Avro data.
+//!
+//! # Low-level decoders
+//!
+//! This module contains the low-level decoders for binary Avro data. It is strongly recommended to
+//! use the high-level readers in [`reader`]. This should only be used if you are decoding a custom
+//! file format or are using an async runtime not supported in [`reader`].
+//!
+//! # Usage
+//! The decoder implementations are based on finite state machines, expressed through the [`Fsm`]
+//! trait. A decoder is supplied with a [`Buffer`] that has some (but not necessarily all) data. The
+//! decoder will decode as far as it can. If it does not have enough data, it will return
+//! [`FsmControlFlow::NeedMore`]. By filling the buffer with more data, the decoder can be resumed.
+//! If the end of the data stream is reached and the decoder is still returning [`FsmControlFlow::NeedMore`]
+//! then the data stream is corrupt and an error should be thrown.
+//!
+//! If the decoder is finished decoding, it will return a [`FsmControlFlow::Done`] which will also
+//! consume the decoder, preventing accidental reuse of an already finished decoder.
+//!
+//! The supplied buffer must have space for at least 16 bytes, any less and some decoders won't be
+//! able to make progress.
+//!
+//! ```no_run
+//! # use apache_avro::{Schema, decode2::{DatumFsm, Fsm, FsmControlFlow}};
+//! # use oval::Buffer;
+//! # use std::{fs::File, io::Read};
+//! # let schema = Schema::Bytes;
+//!
+//! let mut buffer = Buffer::with_capacity(256);
+//! let mut file = File::open("some").unwrap();
+//! let mut fsm = DatumFsm::new(&schema);
+//!
+//! // If the schema is Schema::Null, it's perfectly valid for the file to be empty
+//! // so we don't check the amount of bytes filled the first time.
+//! let bytes_read = file.read(buffer.space()).unwrap();
+//! buffer.fill(bytes_read);
+//!
+//! let result = loop {
+//!     match fsm.parse(&mut buffer).unwrap() {
+//!         FsmControlFlow::NeedMore(new_fsm) => {
+//!             fsm = new_fsm;
+//!             let bytes_read = file.read(buffer.space()).unwrap();
+//!             if bytes_read == 0 {
+//!                 panic!("File is finished but decoder is not");
+//!             }
+//!             buffer.fill(bytes_read);
+//!         }
+//!         FsmControlFlow::Done(value) => {
+//!             break value;
+//!         }
+//!     }
+//! };
+//! println!("{result:?}");
+//! ```
+//!
+//!
+//! [`reader`]: crate::reader
+//! [`FsmControlFlow::NeedMore`]: crate::util::low_level::FsmControlFlow::NeedMore
+//! [`FsmControlFlow::Done`]: crate::util::low_level::FsmControlFlow::Done
+
+mod codec;
+mod complex;
+mod logical;
+pub mod object_container;
+mod primitive;
+
 use crate::{
     AvroResult, Error,
-    bigdecimal::deserialize_big_decimal,
-    decimal::Decimal,
-    duration::Duration,
-    error::Details,
-    schema::{
-        DecimalSchema, EnumSchema, FixedSchema, Name, Namespace, RecordSchema, ResolvedSchema,
-        Schema,
-    },
-    types::Value,
-    util::{safe_len, zag_i32, zag_i64},
-};
-use std::{
-    borrow::Borrow,
-    collections::HashMap,
-    io::{ErrorKind, Read},
-};
-use uuid::Uuid;
-
-#[inline]
-pub(crate) fn decode_long<R: Read>(reader: &mut R) -> AvroResult<Value> {
-    zag_i64(reader).map(Value::Long)
-}
-
-#[inline]
-fn decode_int<R: Read>(reader: &mut R) -> AvroResult<Value> {
-    zag_i32(reader).map(Value::Int)
-}
-
-#[inline]
-pub(crate) fn decode_len<R: Read>(reader: &mut R) -> AvroResult<usize> {
-    let len = zag_i64(reader)?;
-    safe_len(usize::try_from(len).map_err(|e| Details::ConvertI64ToUsize(e, len))?)
-}
-
-/// Decode the length of a sequence.
-///
-/// Maps and arrays are 0-terminated, 0i64 is also encoded as 0 in Avro reading a length of 0 means
-/// the end of the map or array.
-fn decode_seq_len<R: Read>(reader: &mut R) -> AvroResult<usize> {
-    let raw_len = zag_i64(reader)?;
-    safe_len(
-        usize::try_from(match raw_len.cmp(&0) {
-            std::cmp::Ordering::Equal => return Ok(0),
-            std::cmp::Ordering::Less => {
-                let _size = zag_i64(reader)?;
-                raw_len.checked_neg().ok_or(Details::IntegerOverflow)?
-            }
-            std::cmp::Ordering::Greater => raw_len,
-        })
-        .map_err(|e| Details::ConvertI64ToUsize(e, raw_len))?,
-    )
-}
-
-/// Decode a `Value` from avro format given its `Schema`.
-pub fn decode<R: Read>(schema: &Schema, reader: &mut R) -> AvroResult<Value> {
-    let rs = ResolvedSchema::try_from(schema)?;
-    decode_internal(schema, rs.get_names(), &None, reader)
-}
-
-pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
-    schema: &Schema,
-    names: &HashMap<Name, S>,
-    enclosing_namespace: &Namespace,
-    reader: &mut R,
-) -> AvroResult<Value> {
-    match *schema {
-        Schema::Null => Ok(Value::Null),
-        Schema::Boolean => {
-            let mut buf = [0u8; 1];
-            match reader.read_exact(&mut buf[..]) {
-                Ok(_) => match buf[0] {
-                    0u8 => Ok(Value::Boolean(false)),
-                    1u8 => Ok(Value::Boolean(true)),
-                    _ => Err(Details::BoolValue(buf[0]).into()),
-                },
-                Err(io_err) => {
-                    if let ErrorKind::UnexpectedEof = io_err.kind() {
-                        Ok(Value::Null)
-                    } else {
-                        Err(Details::ReadBoolean(io_err).into())
-                    }
-                }
-            }
-        }
-        Schema::Decimal(DecimalSchema { ref inner, .. }) => match &**inner {
-            Schema::Fixed { .. } => {
-                match decode_internal(inner, names, enclosing_namespace, reader)? {
-                    Value::Fixed(_, bytes) => Ok(Value::Decimal(Decimal::from(bytes))),
-                    value => Err(Details::FixedValue(value).into()),
-                }
-            }
-            Schema::Bytes => match decode_internal(inner, names, enclosing_namespace, reader)? {
-                Value::Bytes(bytes) => Ok(Value::Decimal(Decimal::from(bytes))),
-                value => Err(Details::BytesValue(value).into()),
+    decode::{
+        complex::{
+            EnumFsm,
+            block::{ArrayFsm, MapFsm},
+            record::RecordFsm,
+            union::UnionFsm,
+        },
+        logical::{
+            decimal::{BigDecimalFsm, DecimalFsm},
+            time::{
+                DateFsm, DurationFsm, LocalTimestampMicrosFsm, LocalTimestampMillisFsm,
+                LocalTimestampNanosFsm, TimeMicrosFsm, TimeMillisFsm, TimestampMicrosFsm,
+                TimestampMillisFsm, TimestampNanosFsm,
             },
-            schema => Err(Details::ResolveDecimalSchema(schema.into()).into()),
+            uuid::UuidFsm,
         },
-        Schema::BigDecimal => {
-            match decode_internal(&Schema::Bytes, names, enclosing_namespace, reader)? {
-                Value::Bytes(bytes) => deserialize_big_decimal(&bytes).map(Value::BigDecimal),
-                value => Err(Details::BytesValue(value).into()),
-            }
-        }
-        Schema::Uuid => {
-            let Value::Bytes(bytes) =
-                decode_internal(&Schema::Bytes, names, enclosing_namespace, reader)?
-            else {
-                // Calling decode_internal with Schema::Bytes can only return a Value::Bytes or an error
-                unreachable!();
-            };
-
-            let uuid = if bytes.len() == 16 {
-                Uuid::from_slice(&bytes).map_err(Details::ConvertSliceToUuid)?
-            } else {
-                let string = std::str::from_utf8(&bytes).map_err(Details::ConvertToUtf8Error)?;
-                Uuid::parse_str(string).map_err(Details::ConvertStrToUuid)?
-            };
-            Ok(Value::Uuid(uuid))
-        }
-        Schema::Int => decode_int(reader),
-        Schema::Date => zag_i32(reader).map(Value::Date),
-        Schema::TimeMillis => zag_i32(reader).map(Value::TimeMillis),
-        Schema::Long => decode_long(reader),
-        Schema::TimeMicros => zag_i64(reader).map(Value::TimeMicros),
-        Schema::TimestampMillis => zag_i64(reader).map(Value::TimestampMillis),
-        Schema::TimestampMicros => zag_i64(reader).map(Value::TimestampMicros),
-        Schema::TimestampNanos => zag_i64(reader).map(Value::TimestampNanos),
-        Schema::LocalTimestampMillis => zag_i64(reader).map(Value::LocalTimestampMillis),
-        Schema::LocalTimestampMicros => zag_i64(reader).map(Value::LocalTimestampMicros),
-        Schema::LocalTimestampNanos => zag_i64(reader).map(Value::LocalTimestampNanos),
-        Schema::Duration => {
-            let mut buf = [0u8; 12];
-            reader.read_exact(&mut buf).map_err(Details::ReadDuration)?;
-            Ok(Value::Duration(Duration::from(buf)))
-        }
-        Schema::Float => {
-            let mut buf = [0u8; std::mem::size_of::<f32>()];
-            reader
-                .read_exact(&mut buf[..])
-                .map_err(Details::ReadFloat)?;
-            Ok(Value::Float(f32::from_le_bytes(buf)))
-        }
-        Schema::Double => {
-            let mut buf = [0u8; std::mem::size_of::<f64>()];
-            reader
-                .read_exact(&mut buf[..])
-                .map_err(Details::ReadDouble)?;
-            Ok(Value::Double(f64::from_le_bytes(buf)))
-        }
-        Schema::Bytes => {
-            let len = decode_len(reader)?;
-            let mut buf = vec![0u8; len];
-            reader.read_exact(&mut buf).map_err(Details::ReadBytes)?;
-            Ok(Value::Bytes(buf))
-        }
-        Schema::String => {
-            let len = decode_len(reader)?;
-            let mut buf = vec![0u8; len];
-            match reader.read_exact(&mut buf) {
-                Ok(_) => Ok(Value::String(
-                    String::from_utf8(buf).map_err(Details::ConvertToUtf8)?,
-                )),
-                Err(io_err) => {
-                    if let ErrorKind::UnexpectedEof = io_err.kind() {
-                        Ok(Value::Null)
-                    } else {
-                        Err(Details::ReadString(io_err).into())
-                    }
-                }
-            }
-        }
-        Schema::Fixed(FixedSchema { size, .. }) => {
-            let mut buf = vec![0u8; size];
-            reader
-                .read_exact(&mut buf)
-                .map_err(|e| Details::ReadFixed(e, size))?;
-            Ok(Value::Fixed(size, buf))
-        }
-        Schema::Array(ref inner) => {
-            let mut items = Vec::new();
-
-            loop {
-                let len = decode_seq_len(reader)?;
-                if len == 0 {
-                    break;
-                }
-
-                items.reserve(len);
-                for _ in 0..len {
-                    items.push(decode_internal(
-                        &inner.items,
-                        names,
-                        enclosing_namespace,
-                        reader,
-                    )?);
-                }
-            }
-
-            Ok(Value::Array(items))
-        }
-        Schema::Map(ref inner) => {
-            let mut items = HashMap::new();
-
-            loop {
-                let len = decode_seq_len(reader)?;
-                if len == 0 {
-                    break;
-                }
-
-                items.reserve(len);
-                for _ in 0..len {
-                    match decode_internal(&Schema::String, names, enclosing_namespace, reader)? {
-                        Value::String(key) => {
-                            let value =
-                                decode_internal(&inner.types, names, enclosing_namespace, reader)?;
-                            items.insert(key, value);
-                        }
-                        value => return Err(Details::MapKeyType(value.into()).into()),
-                    }
-                }
-            }
-
-            Ok(Value::Map(items))
-        }
-        Schema::Union(ref inner) => match zag_i64(reader).map_err(Error::into_details) {
-            Ok(index) => {
-                let variants = inner.variants();
-                let variant = variants
-                    .get(usize::try_from(index).map_err(|e| Details::ConvertI64ToUsize(e, index))?)
-                    .ok_or(Details::GetUnionVariant {
-                        index,
-                        num_variants: variants.len(),
-                    })?;
-                let value = decode_internal(variant, names, enclosing_namespace, reader)?;
-                Ok(Value::Union(index as u32, Box::new(value)))
-            }
-            Err(Details::ReadVariableIntegerBytes(io_err)) => {
-                if let ErrorKind::UnexpectedEof = io_err.kind() {
-                    Ok(Value::Union(0, Box::new(Value::Null)))
-                } else {
-                    Err(Details::ReadVariableIntegerBytes(io_err).into())
-                }
-            }
-            Err(io_err) => Err(Error::new(io_err)),
+        primitive::{
+            BoolFsm, NullFsm,
+            bytes::{BytesFsm, FixedFsm, StringFsm},
+            floats::{DoubleFsm, FloatFsm},
+            zigzag::{IntFsm, LongFsm},
         },
-        Schema::Record(RecordSchema {
-            ref name,
-            ref fields,
-            ..
-        }) => {
-            let fully_qualified_name = name.fully_qualified_name(enclosing_namespace);
-            // Benchmarks indicate ~10% improvement using this method.
-            let mut items = Vec::with_capacity(fields.len());
-            for field in fields {
-                // TODO: This clone is also expensive. See if we can do away with it...
-                items.push((
-                    field.name.clone(),
-                    decode_internal(
-                        &field.schema,
-                        names,
-                        &fully_qualified_name.namespace,
-                        reader,
-                    )?,
-                ));
-            }
-            Ok(Value::Record(items))
+    },
+    error::Details,
+    schema::{ArraySchema, FixedSchema, MapSchema, NamesRef, Schema},
+    types::Value,
+    util::{
+        low_level::{Fsm, FsmResult},
+        safe_len,
+    },
+};
+use oval::Buffer;
+use std::io::ErrorKind;
+
+/// Read a zigzagged varint from the buffer.
+///
+/// Will only consume the buffer if a whole number has been read.
+/// If insufficient bytes are available it will return `Ok(None)` to
+/// indicate it needs more bytes.
+fn decode_zigzag_buffer(buffer: &mut Buffer) -> Result<Option<i64>, Error> {
+    if let Some((decoded, consumed)) = decode_variable(buffer.data())? {
+        buffer.consume(consumed);
+        Ok(Some(decoded))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Decode a zigzag encoded length.
+///
+/// This version of [`decode_len`] will return a [`Details::ReadVariableIntegerBytes`] error if there are not
+/// enough bytes and does not return the amount of bytes read.
+///
+/// See [`decode_len`] for more details.
+pub(crate) fn decode_len_simple(buffer: &[u8]) -> AvroResult<(usize, usize)> {
+    decode_len(buffer)?
+        .ok_or_else(|| Details::ReadVariableIntegerBytes(ErrorKind::UnexpectedEof.into()).into())
+}
+
+/// Decode a zigzag encoded length.
+///
+/// This will use [`safe_len`] to check if the length is in allowed bounds.
+///
+/// # Returns
+/// `Some(integer, bytes read)` if it completely read an integer, `None` if it did not have enough
+/// bytes in the slice.
+pub(crate) fn decode_len(buffer: &[u8]) -> AvroResult<Option<(usize, usize)>> {
+    if let Some((integer, bytes)) = decode_variable(buffer)? {
+        let length =
+            usize::try_from(integer).map_err(|e| Details::ConvertI64ToUsize(e, integer))?;
+        let safe = safe_len(length)?;
+        Ok(Some((safe, bytes)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Decode a zigzag encoded integer.
+///
+/// # Returns
+/// `Some(integer, bytes read)` if it completely read an integer, `None` if it did not have enough
+/// bytes in the slice.
+pub(crate) fn decode_variable(buffer: &[u8]) -> Result<Option<(i64, usize)>, Error> {
+    let mut decoded = 0;
+    let mut loops_done = 0;
+    let mut last_byte = 0;
+
+    if buffer.is_empty() {
+        return Ok(None);
+    }
+
+    for (counter, &byte) in buffer.iter().take(10).enumerate() {
+        decoded |= u64::from(byte & 0x7F) << (counter * 7);
+        loops_done = counter;
+        last_byte = byte;
+        if byte >> 7 == 0 {
+            break;
         }
-        Schema::Enum(EnumSchema { ref symbols, .. }) => {
-            Ok(if let Value::Int(raw_index) = decode_int(reader)? {
-                let index = usize::try_from(raw_index)
-                    .map_err(|e| Details::ConvertI32ToUsize(e, raw_index))?;
-                if (0..symbols.len()).contains(&index) {
-                    let symbol = symbols[index].clone();
-                    Value::Enum(raw_index as u32, symbol)
+    }
+
+    if last_byte >> 7 != 0 {
+        if loops_done == 9 {
+            Err(Details::IntegerOverflow.into())
+        } else {
+            Ok(None)
+        }
+    } else if decoded & 0x1 == 0 {
+        Ok(Some(((decoded >> 1) as i64, loops_done + 1)))
+    } else {
+        Ok(Some((!(decoded >> 1) as i64, loops_done + 1)))
+    }
+}
+
+/// A state machine to parse an Avro datum.
+pub struct DatumFsm<'a> {
+    /// This is just a thin wrapper around [`SubFsm`] to hide the implementation details from the user.
+    fsm: SubFsm<'a>,
+}
+impl<'a> DatumFsm<'a> {
+    pub fn new(schema: &'a Schema, names: &'a NamesRef<'a>) -> Result<Self, Error> {
+        Ok(Self {
+            fsm: SubFsm::new(schema, names)?,
+        })
+    }
+}
+impl<'a> Fsm for DatumFsm<'a> {
+    type Output = Value;
+
+    fn parse(self, buffer: &mut Buffer) -> FsmResult<Self, Self::Output> {
+        Ok(self.fsm.parse(buffer)?.map(|fsm| Self { fsm }, |v| v))
+    }
+}
+
+enum SubFsm<'a> {
+    Null(NullFsm),
+    Boolean(BoolFsm),
+    Int(IntFsm),
+    Long(LongFsm),
+    Float(FloatFsm),
+    Double(DoubleFsm),
+    Bytes(BytesFsm),
+    String(StringFsm),
+    Fixed(FixedFsm),
+    Enum(EnumFsm<'a>),
+    Union(UnionFsm<'a>),
+    Array(ArrayFsm<'a>),
+    Map(MapFsm<'a>),
+    Record(RecordFsm<'a>),
+    Date(DateFsm),
+    Decimal(DecimalFsm),
+    BigDecimal(BigDecimalFsm),
+    TimeMillis(TimeMillisFsm),
+    TimeMicros(TimeMicrosFsm),
+    TimestampMillis(TimestampMillisFsm),
+    TimestampMicros(TimestampMicrosFsm),
+    TimestampNanos(TimestampNanosFsm),
+    LocalTimestampMillis(LocalTimestampMillisFsm),
+    LocalTimestampMicros(LocalTimestampMicrosFsm),
+    LocalTimestampNanos(LocalTimestampNanosFsm),
+    Duration(DurationFsm),
+    Uuid(UuidFsm),
+}
+
+impl<'a> SubFsm<'a> {
+    pub fn new(schema: &'a Schema, names: &'a NamesRef<'a>) -> Result<Self, Error> {
+        match schema {
+            Schema::Null => Ok(Self::Null(NullFsm)),
+            Schema::Boolean => Ok(Self::Boolean(BoolFsm)),
+            Schema::Int => Ok(Self::Int(IntFsm::default())),
+            Schema::Long => Ok(Self::Long(LongFsm::default())),
+            Schema::Float => Ok(Self::Float(FloatFsm)),
+            Schema::Double => Ok(Self::Double(DoubleFsm)),
+            Schema::Bytes => Ok(Self::Bytes(BytesFsm::default())),
+            Schema::String => Ok(Self::String(StringFsm::default())),
+            Schema::Array(ArraySchema { items, .. }) => {
+                Ok(Self::Array(ArrayFsm::new(items, names)))
+            }
+            Schema::Map(MapSchema { types, .. }) => Ok(Self::Map(MapFsm::new(types, names))),
+            Schema::Union(schema) => Ok(Self::Union(UnionFsm::new(schema, names))),
+            Schema::Record(schema) => Ok(Self::Record(RecordFsm::new(schema, names))),
+            Schema::Enum(schema) => Ok(Self::Enum(EnumFsm::new(schema))),
+            Schema::Fixed(FixedSchema { size, .. }) => Ok(Self::Fixed(FixedFsm::new(*size))),
+            Schema::Decimal(schema) => Ok(Self::Decimal(DecimalFsm::new(schema))),
+            Schema::BigDecimal => Ok(Self::BigDecimal(BigDecimalFsm::default())),
+            Schema::Uuid(schema) => Ok(Self::Uuid(UuidFsm::new(schema))),
+            Schema::Date => Ok(Self::Date(DateFsm::default())),
+            Schema::TimeMillis => Ok(Self::TimeMillis(TimeMillisFsm::default())),
+            Schema::TimeMicros => Ok(Self::TimeMicros(TimeMicrosFsm::default())),
+            Schema::TimestampMillis => Ok(Self::TimestampMillis(TimestampMillisFsm::default())),
+            Schema::TimestampMicros => Ok(Self::TimestampMicros(TimestampMicrosFsm::default())),
+            Schema::TimestampNanos => Ok(Self::TimestampNanos(TimestampNanosFsm::default())),
+            Schema::LocalTimestampMillis => Ok(Self::LocalTimestampMillis(
+                LocalTimestampMillisFsm::default(),
+            )),
+            Schema::LocalTimestampMicros => Ok(Self::LocalTimestampMicros(
+                LocalTimestampMicrosFsm::default(),
+            )),
+            Schema::LocalTimestampNanos => {
+                Ok(Self::LocalTimestampNanos(LocalTimestampNanosFsm::default()))
+            }
+            Schema::Duration => Ok(Self::Duration(DurationFsm::default())),
+            Schema::Ref { name } => {
+                if let Some(schema) = names.get(name) {
+                    Self::new(schema, names)
                 } else {
-                    return Err(Details::GetEnumValue {
-                        index,
-                        nsymbols: symbols.len(),
-                    }
-                    .into());
+                    Err(Error::new(Details::SchemaResolutionError(name.clone())))
                 }
-            } else {
-                return Err(Details::GetEnumUnknownIndexValue.into());
-            })
-        }
-        Schema::Ref { ref name } => {
-            let fully_qualified_name = name.fully_qualified_name(enclosing_namespace);
-            if let Some(resolved) = names.get(&fully_qualified_name) {
-                decode_internal(
-                    resolved.borrow(),
-                    names,
-                    &fully_qualified_name.namespace,
-                    reader,
-                )
-            } else {
-                Err(Details::SchemaResolutionError(fully_qualified_name).into())
             }
+        }
+    }
+}
+
+impl<'a> Default for SubFsm<'a> {
+    fn default() -> Self {
+        Self::Null(NullFsm)
+    }
+}
+
+impl<'a> Fsm for SubFsm<'a> {
+    type Output = Value;
+
+    fn parse(self, buffer: &mut Buffer) -> FsmResult<Self, Self::Output> {
+        match self {
+            Self::Null(fsm) => Ok(fsm.parse(buffer)?.map(Self::Null, |v| v)),
+            Self::Boolean(fsm) => Ok(fsm.parse(buffer)?.map(Self::Boolean, |v| v)),
+            Self::Int(fsm) => Ok(fsm.parse(buffer)?.map(Self::Int, |v| v)),
+            Self::Long(fsm) => Ok(fsm.parse(buffer)?.map(Self::Long, |v| v)),
+            Self::Float(fsm) => Ok(fsm.parse(buffer)?.map(Self::Float, |v| v)),
+            Self::Double(fsm) => Ok(fsm.parse(buffer)?.map(Self::Double, |v| v)),
+            Self::Bytes(fsm) => Ok(fsm.parse(buffer)?.map(Self::Bytes, |v| v)),
+            Self::String(fsm) => Ok(fsm.parse(buffer)?.map(Self::String, |v| v)),
+            Self::Fixed(fsm) => Ok(fsm.parse(buffer)?.map(Self::Fixed, |v| v)),
+            Self::Enum(fsm) => Ok(fsm.parse(buffer)?.map(Self::Enum, |v| v)),
+            Self::Union(fsm) => Ok(fsm.parse(buffer)?.map(Self::Union, |v| v)),
+            Self::Array(fsm) => Ok(fsm.parse(buffer)?.map(Self::Array, |v| v)),
+            Self::Map(fsm) => Ok(fsm.parse(buffer)?.map(Self::Map, |v| v)),
+            Self::Record(fsm) => Ok(fsm.parse(buffer)?.map(Self::Record, |v| v)),
+            Self::Date(fsm) => Ok(fsm.parse(buffer)?.map(Self::Date, |v| v)),
+            Self::Decimal(fsm) => Ok(fsm.parse(buffer)?.map(Self::Decimal, |v| v)),
+            Self::BigDecimal(fsm) => Ok(fsm.parse(buffer)?.map(Self::BigDecimal, |v| v)),
+            Self::TimeMillis(fsm) => Ok(fsm.parse(buffer)?.map(Self::TimeMillis, |v| v)),
+            Self::TimeMicros(fsm) => Ok(fsm.parse(buffer)?.map(Self::TimeMicros, |v| v)),
+            Self::TimestampMillis(fsm) => Ok(fsm.parse(buffer)?.map(Self::TimestampMillis, |v| v)),
+            Self::TimestampMicros(fsm) => Ok(fsm.parse(buffer)?.map(Self::TimestampMicros, |v| v)),
+            Self::TimestampNanos(fsm) => Ok(fsm.parse(buffer)?.map(Self::TimestampNanos, |v| v)),
+            Self::LocalTimestampMillis(fsm) => {
+                Ok(fsm.parse(buffer)?.map(Self::LocalTimestampMillis, |v| v))
+            }
+            Self::LocalTimestampMicros(fsm) => {
+                Ok(fsm.parse(buffer)?.map(Self::LocalTimestampMicros, |v| v))
+            }
+            Self::LocalTimestampNanos(fsm) => {
+                Ok(fsm.parse(buffer)?.map(Self::LocalTimestampNanos, |v| v))
+            }
+            Self::Duration(fsm) => Ok(fsm.parse(buffer)?.map(Self::Duration, |v| v)),
+            Self::Uuid(fsm) => Ok(fsm.parse(buffer)?.map(Self::Uuid, |v| v)),
         }
     }
 }
@@ -322,24 +347,49 @@ pub(crate) fn decode_internal<R: Read, S: Borrow<Schema>>(
 #[allow(clippy::expect_fun_call)]
 mod tests {
     use crate::{
-        Decimal,
-        decode::decode,
+        Decimal, Error,
+        decode::{SubFsm, decode_variable},
         encode::{encode, tests::success},
-        schema::{DecimalSchema, FixedSchema, Schema},
-        types::{
-            Value,
-            Value::{Array, Int, Map},
+        error::Details,
+        schema::{
+            DecimalSchema, FixedSchema, InnerDecimalSchema, ResolvedSchema, Schema, UuidSchema,
         },
+        types::Value::{self, Array, Int, Map},
+        util::low_level::{Fsm, FsmControlFlow},
     };
     use apache_avro_test_helper::TestResult;
+    use oval::Buffer;
     use pretty_assertions::assert_eq;
     use std::collections::HashMap;
     use uuid::Uuid;
 
+    fn decode(schema: &Schema, input: &[u8]) -> Result<Value, Error> {
+        let resolved = ResolvedSchema::try_from(schema)?;
+        let mut buffer = Buffer::from_slice(input);
+        let fsm = SubFsm::new(schema, resolved.get_names())?;
+        match fsm.parse(&mut buffer)? {
+            FsmControlFlow::NeedMore(_) => {
+                panic!("Should not be NeedMore");
+            }
+            FsmControlFlow::Done(value) => Ok(value),
+        }
+    }
+
+    #[test]
+    fn test_decode_variable_overflow() {
+        let causes_left_shift_overflow: &[u8] = &[0xe1; 10];
+        assert!(matches!(
+            decode_variable(causes_left_shift_overflow)
+                .unwrap_err()
+                .details(),
+            Details::IntegerOverflow
+        ));
+    }
+
     #[test]
     fn test_decode_array_without_size() -> TestResult {
-        let mut input: &[u8] = &[6, 2, 4, 6, 0];
-        let result = decode(&Schema::array(Schema::Int), &mut input);
+        let input: &[u8] = &[6, 2, 4, 6, 0];
+        let result = decode(&Schema::array(Schema::Int), input);
         assert_eq!(Array(vec!(Int(1), Int(2), Int(3))), result?);
 
         Ok(())
@@ -347,8 +397,8 @@ mod tests {
 
     #[test]
     fn test_decode_array_with_size() -> TestResult {
-        let mut input: &[u8] = &[5, 6, 2, 4, 6, 0];
-        let result = decode(&Schema::array(Schema::Int), &mut input);
+        let input: &[u8] = &[5, 6, 2, 4, 6, 0];
+        let result = decode(&Schema::array(Schema::Int), input);
         assert_eq!(Array(vec!(Int(1), Int(2), Int(3))), result?);
 
         Ok(())
@@ -356,8 +406,8 @@ mod tests {
 
     #[test]
     fn test_decode_map_without_size() -> TestResult {
-        let mut input: &[u8] = &[0x02, 0x08, 0x74, 0x65, 0x73, 0x74, 0x02, 0x00];
-        let result = decode(&Schema::map(Schema::Int), &mut input);
+        let input: &[u8] = &[0x02, 0x08, 0x74, 0x65, 0x73, 0x74, 0x02, 0x00];
+        let result = decode(&Schema::map(Schema::Int), input);
         let mut expected = HashMap::new();
         expected.insert(String::from("test"), Int(1));
         assert_eq!(Map(expected), result?);
@@ -367,8 +417,8 @@ mod tests {
 
     #[test]
     fn test_decode_map_with_size() -> TestResult {
-        let mut input: &[u8] = &[0x01, 0x0C, 0x08, 0x74, 0x65, 0x73, 0x74, 0x02, 0x00];
-        let result = decode(&Schema::map(Schema::Int), &mut input);
+        let input: &[u8] = &[0x01, 0x0C, 0x08, 0x74, 0x65, 0x73, 0x74, 0x02, 0x00];
+        let result = decode(&Schema::map(Schema::Int), input);
         let mut expected = HashMap::new();
         expected.insert(String::from("test"), Int(1));
         assert_eq!(Map(expected), result?);
@@ -380,14 +430,13 @@ mod tests {
     fn test_negative_decimal_value() -> TestResult {
         use crate::{encode::encode, schema::Name};
         use num_bigint::ToBigInt;
-        let inner = Box::new(Schema::Fixed(
-            FixedSchema::builder()
-                .name(Name::new("decimal")?)
-                .size(2)
-                .build(),
-        ));
         let schema = Schema::Decimal(DecimalSchema {
-            inner,
+            inner: InnerDecimalSchema::Fixed(
+                FixedSchema::builder()
+                    .name(Name::new("decimal")?)
+                    .size(2)
+                    .build(),
+            ),
             precision: 4,
             scale: 2,
         });
@@ -397,8 +446,8 @@ mod tests {
         let mut buffer = Vec::new();
         encode(&value, &schema, &mut buffer).expect(&success(&value, &schema));
 
-        let mut bytes = &buffer[..];
-        let result = decode(&schema, &mut bytes)?;
+        let bytes = &buffer[..];
+        let result = decode(&schema, bytes)?;
         assert_eq!(result, value);
 
         Ok(())
@@ -408,16 +457,15 @@ mod tests {
     fn test_decode_decimal_with_bigger_than_necessary_size() -> TestResult {
         use crate::{encode::encode, schema::Name};
         use num_bigint::ToBigInt;
-        let inner = Box::new(Schema::Fixed(FixedSchema {
-            size: 13,
-            name: Name::new("decimal")?,
-            aliases: None,
-            doc: None,
-            default: None,
-            attributes: Default::default(),
-        }));
         let schema = Schema::Decimal(DecimalSchema {
-            inner,
+            inner: InnerDecimalSchema::Fixed(FixedSchema {
+                size: 13,
+                name: Name::new("decimal")?,
+                aliases: None,
+                doc: None,
+                default: None,
+                attributes: Default::default(),
+            }),
             precision: 4,
             scale: 2,
         });
@@ -427,8 +475,8 @@ mod tests {
         let mut buffer = Vec::<u8>::new();
 
         encode(&value, &schema, &mut buffer).expect(&success(&value, &schema));
-        let mut bytes: &[u8] = &buffer[..];
-        let result = decode(&schema, &mut bytes)?;
+        let bytes: &[u8] = &buffer[..];
+        let result = decode(&schema, bytes)?;
         assert_eq!(result, value);
 
         Ok(())
@@ -471,10 +519,10 @@ mod tests {
         let mut buf = Vec::new();
         encode(&outer_value1, &schema, &mut buf).expect(&success(&outer_value1, &schema));
         assert!(!buf.is_empty());
-        let mut bytes = &buf[..];
+        let bytes = &buf[..];
         assert_eq!(
             outer_value1,
-            decode(&schema, &mut bytes).expect(&format!(
+            decode(&schema, bytes).expect(&format!(
                 "Failed to decode using recursive definitions with schema:\n {:?}\n",
                 &schema
             ))
@@ -486,10 +534,10 @@ mod tests {
             ("b".into(), inner_value2),
         ]);
         encode(&outer_value2, &schema, &mut buf).expect(&success(&outer_value2, &schema));
-        let mut bytes = &buf[..];
+        let bytes = &buf[..];
         assert_eq!(
             outer_value2,
-            decode(&schema, &mut bytes).expect(&format!(
+            decode(&schema, bytes).expect(&format!(
                 "Failed to decode using recursive definitions with schema:\n {:?}\n",
                 &schema
             ))
@@ -536,10 +584,10 @@ mod tests {
         ]);
         let mut buf = Vec::new();
         encode(&outer_value, &schema, &mut buf).expect(&success(&outer_value, &schema));
-        let mut bytes = &buf[..];
+        let bytes = &buf[..];
         assert_eq!(
             outer_value,
-            decode(&schema, &mut bytes).expect(&format!(
+            decode(&schema, bytes).expect(&format!(
                 "Failed to decode using recursive definitions with schema:\n {:?}\n",
                 &schema
             ))
@@ -589,10 +637,10 @@ mod tests {
         ]);
         let mut buf = Vec::new();
         encode(&outer_value, &schema, &mut buf).expect(&success(&outer_value, &schema));
-        let mut bytes = &buf[..];
+        let bytes = &buf[..];
         assert_eq!(
             outer_value,
-            decode(&schema, &mut bytes).expect(&format!(
+            decode(&schema, bytes).expect(&format!(
                 "Failed to decode using recursive definitions with schema:\n {:?}\n",
                 &schema
             ))
@@ -681,10 +729,10 @@ mod tests {
         let mut buf = Vec::new();
         encode(&outer_record_variation_1, &schema, &mut buf)
             .expect(&success(&outer_record_variation_1, &schema));
-        let mut bytes = &buf[..];
+        let bytes = &buf[..];
         assert_eq!(
             outer_record_variation_1,
-            decode(&schema, &mut bytes).expect(&format!(
+            decode(&schema, bytes).expect(&format!(
                 "Failed to Decode with recursively defined namespace with schema:\n {:?}\n",
                 &schema
             ))
@@ -693,10 +741,10 @@ mod tests {
         let mut buf = Vec::new();
         encode(&outer_record_variation_2, &schema, &mut buf)
             .expect(&success(&outer_record_variation_2, &schema));
-        let mut bytes = &buf[..];
+        let bytes = &buf[..];
         assert_eq!(
             outer_record_variation_2,
-            decode(&schema, &mut bytes).expect(&format!(
+            decode(&schema, bytes).expect(&format!(
                 "Failed to Decode with recursively defined namespace with schema:\n {:?}\n",
                 &schema
             ))
@@ -705,10 +753,10 @@ mod tests {
         let mut buf = Vec::new();
         encode(&outer_record_variation_3, &schema, &mut buf)
             .expect(&success(&outer_record_variation_3, &schema));
-        let mut bytes = &buf[..];
+        let bytes = &buf[..];
         assert_eq!(
             outer_record_variation_3,
-            decode(&schema, &mut bytes).expect(&format!(
+            decode(&schema, bytes).expect(&format!(
                 "Failed to Decode with recursively defined namespace with schema:\n {:?}\n",
                 &schema
             ))
@@ -798,10 +846,10 @@ mod tests {
         let mut buf = Vec::new();
         encode(&outer_record_variation_1, &schema, &mut buf)
             .expect(&success(&outer_record_variation_1, &schema));
-        let mut bytes = &buf[..];
+        let bytes = &buf[..];
         assert_eq!(
             outer_record_variation_1,
-            decode(&schema, &mut bytes).expect(&format!(
+            decode(&schema, bytes).expect(&format!(
                 "Failed to Decode with recursively defined namespace with schema:\n {:?}\n",
                 &schema
             ))
@@ -810,10 +858,10 @@ mod tests {
         let mut buf = Vec::new();
         encode(&outer_record_variation_2, &schema, &mut buf)
             .expect(&success(&outer_record_variation_2, &schema));
-        let mut bytes = &buf[..];
+        let bytes = &buf[..];
         assert_eq!(
             outer_record_variation_2,
-            decode(&schema, &mut bytes).expect(&format!(
+            decode(&schema, bytes).expect(&format!(
                 "Failed to Decode with recursively defined namespace with schema:\n {:?}\n",
                 &schema
             ))
@@ -822,10 +870,10 @@ mod tests {
         let mut buf = Vec::new();
         encode(&outer_record_variation_3, &schema, &mut buf)
             .expect(&success(&outer_record_variation_3, &schema));
-        let mut bytes = &buf[..];
+        let bytes = &buf[..];
         assert_eq!(
             outer_record_variation_3,
-            decode(&schema, &mut bytes).expect(&format!(
+            decode(&schema, bytes).expect(&format!(
                 "Failed to Decode with recursively defined namespace with schema:\n {:?}\n",
                 &schema
             ))
@@ -844,7 +892,7 @@ mod tests {
         let mut buffer = Vec::new();
         encode(&value, &schema, &mut buffer).expect(&success(&value, &schema));
 
-        let result = decode(&Schema::Uuid, &mut &buffer[..])?;
+        let result = decode(&Schema::Uuid(UuidSchema::String), &buffer[..])?;
         assert_eq!(result, value);
 
         Ok(())
@@ -854,20 +902,38 @@ mod tests {
     fn avro_3926_encode_decode_uuid_to_fixed() -> TestResult {
         use crate::encode::encode;
 
-        let schema = Schema::Fixed(FixedSchema {
+        let fixed = FixedSchema {
             size: 16,
             name: "uuid".into(),
             aliases: None,
             doc: None,
             default: None,
             attributes: Default::default(),
-        });
+        };
+
+        let schema = Schema::Fixed(fixed.clone());
         let value = Value::Uuid(Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")?);
 
         let mut buffer = Vec::new();
         encode(&value, &schema, &mut buffer).expect(&success(&value, &schema));
 
-        let result = decode(&Schema::Uuid, &mut &buffer[..])?;
+        let result = decode(&Schema::Uuid(UuidSchema::Fixed(fixed)), &buffer[..])?;
+        assert_eq!(result, value);
+
+        Ok(())
+    }
+
+    #[test]
+    fn encode_decode_uuid_to_bytes() -> TestResult {
+        use crate::encode::encode;
+
+        let schema = Schema::Bytes;
+        let value = Value::Uuid(Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")?);
+
+        let mut buffer = Vec::new();
+        encode(&value, &schema, &mut buffer).expect(&success(&value, &schema));
+
+        let result = decode(&Schema::Uuid(UuidSchema::Bytes), &buffer[..])?;
         assert_eq!(result, value);
 
         Ok(())

@@ -20,11 +20,10 @@ use crate::{
     bigdecimal::serialize_big_decimal,
     error::Details,
     schema::{
-        DecimalSchema, EnumSchema, FixedSchema, Name, Namespace, RecordSchema, ResolvedSchema,
-        Schema, SchemaKind, UnionSchema,
+        DecimalSchema, EnumSchema, FixedSchema, InnerDecimalSchema, Name, Namespace, RecordSchema,
+        ResolvedSchema, Schema, SchemaKind, UnionSchema, UuidSchema,
     },
     types::{Value, ValueKind},
-    util::{zig_i32, zig_i64},
 };
 use log::error;
 use std::{borrow::Borrow, collections::HashMap, io::Write};
@@ -50,6 +49,42 @@ pub(crate) fn encode_bytes<B: AsRef<[u8]> + ?Sized, W: Write>(
     encode_long(bytes.len() as i64, &mut writer)?;
     writer
         .write(bytes)
+        .map_err(|e| Details::WriteBytes(e).into())
+}
+
+/// Write the number as a zigzagged varint to the writer.
+pub(crate) fn zig_i32<W: Write>(n: i32, buffer: W) -> AvroResult<usize> {
+    zig_i64(n as i64, buffer)
+}
+
+/// Write the number as a zigzagged varint to the writer.
+pub(crate) fn zig_i64<W: Write>(n: i64, writer: W) -> AvroResult<usize> {
+    let zigzagged = ((n << 1) ^ (n >> 63)) as u64;
+    encode_variable(zigzagged, writer)
+}
+
+/// Write the number as a varint to the writer.
+///
+/// Note: this function does not do zigzag encoding, for that see [`zig_i32`] and [`zig_i64`].
+fn encode_variable<W: Write>(mut zigzagged: u64, mut writer: W) -> AvroResult<usize> {
+    // Ensure the number is little endian for the varint encoding (no-op on LE systems)
+    zigzagged = zigzagged.to_le();
+    // Encode the number as a varint
+    let mut buffer = [0u8; 10];
+    let mut i: usize = 0;
+    loop {
+        if zigzagged <= 0x7F {
+            buffer[i] = (zigzagged & 0x7F) as u8;
+            i += 1;
+            break;
+        } else {
+            buffer[i] = (0x80 | (zigzagged & 0x7F)) as u8;
+            i += 1;
+            zigzagged >>= 7;
+        }
+    }
+    writer
+        .write(&buffer[..i])
         .map_err(|e| Details::WriteBytes(e).into())
 }
 
@@ -111,17 +146,24 @@ pub(crate) fn encode_internal<W: Write, S: Borrow<Schema>>(
             .write(&x.to_le_bytes())
             .map_err(|e| Details::WriteBytes(e).into()),
         Value::Decimal(decimal) => match schema {
-            Schema::Decimal(DecimalSchema { inner, .. }) => match *inner.clone() {
-                Schema::Fixed(FixedSchema { size, .. }) => {
-                    let bytes = decimal.to_sign_extended_bytes_with_len(size).unwrap();
+            Schema::Decimal(DecimalSchema { inner, .. }) => match inner {
+                InnerDecimalSchema::Fixed(fixed) => {
+                    let bytes = decimal.to_sign_extended_bytes_with_len(fixed.size)?;
                     let num_bytes = bytes.len();
-                    if num_bytes != size {
-                        return Err(Details::EncodeDecimalAsFixedError(num_bytes, size).into());
+                    if num_bytes != fixed.size {
+                        return Err(
+                            Details::EncodeDecimalAsFixedError(num_bytes, fixed.size).into()
+                        );
                     }
-                    encode(&Value::Fixed(size, bytes), inner, writer)
+                    encode(
+                        &Value::Fixed(fixed.size, bytes),
+                        &Schema::Fixed(fixed.copy_only_size()),
+                        writer,
+                    )
                 }
-                Schema::Bytes => encode(&Value::Bytes(decimal.try_into()?), inner, writer),
-                _ => Err(Details::ResolveDecimalSchema(SchemaKind::from(*inner.clone())).into()),
+                InnerDecimalSchema::Bytes => {
+                    encode(&Value::Bytes(decimal.try_into()?), &Schema::Bytes, writer)
+                }
             },
             _ => Err(Details::EncodeValueAsSchemaError {
                 value_kind: ValueKind::Decimal,
@@ -136,23 +178,30 @@ pub(crate) fn encode_internal<W: Write, S: Borrow<Schema>>(
                 .map_err(|e| Details::WriteBytes(e).into())
         }
         Value::Uuid(uuid) => match *schema {
-            Schema::Uuid | Schema::String => encode_bytes(
+            Schema::Uuid(UuidSchema::String) | Schema::String => encode_bytes(
                 // we need the call .to_string() to properly convert ASCII to UTF-8
                 #[allow(clippy::unnecessary_to_owned)]
                 &uuid.to_string(),
                 writer,
             ),
-            Schema::Fixed(FixedSchema { size, .. }) => {
+            Schema::Uuid(UuidSchema::Bytes) | Schema::Bytes => {
+                let bytes = uuid.as_bytes();
+                encode_bytes(bytes, writer)
+            }
+            Schema::Uuid(UuidSchema::Fixed(FixedSchema { size, .. }))
+            | Schema::Fixed(FixedSchema { size, .. }) => {
                 if size != 16 {
                     return Err(Details::ConvertFixedToUuid(size).into());
                 }
 
                 let bytes = uuid.as_bytes();
-                encode_bytes(bytes, writer)
+                writer
+                    .write(bytes.as_slice())
+                    .map_err(|e| Details::WriteBytes(e).into())
             }
             _ => Err(Details::EncodeValueAsSchemaError {
                 value_kind: ValueKind::Uuid,
-                supported_schema: vec![SchemaKind::Uuid, SchemaKind::Fixed],
+                supported_schema: vec![SchemaKind::Uuid, SchemaKind::Fixed, SchemaKind::Bytes],
             }
             .into()),
         },
@@ -163,18 +212,18 @@ pub(crate) fn encode_internal<W: Write, S: Borrow<Schema>>(
                 .map_err(|e| Details::WriteBytes(e).into())
         }
         Value::Bytes(bytes) => match *schema {
-            Schema::Bytes => encode_bytes(bytes, writer),
+            Schema::Bytes | Schema::Uuid(UuidSchema::Bytes) => encode_bytes(bytes, writer),
             Schema::Fixed { .. } => writer
                 .write(bytes.as_slice())
                 .map_err(|e| Details::WriteBytes(e).into()),
             _ => Err(Details::EncodeValueAsSchemaError {
                 value_kind: ValueKind::Bytes,
-                supported_schema: vec![SchemaKind::Bytes, SchemaKind::Fixed],
+                supported_schema: vec![SchemaKind::Bytes, SchemaKind::Fixed, SchemaKind::Uuid],
             }
             .into()),
         },
         Value::String(s) => match *schema {
-            Schema::String | Schema::Uuid => encode_bytes(s, writer),
+            Schema::String | Schema::Uuid(UuidSchema::String) => encode_bytes(s, writer),
             Schema::Enum(EnumSchema { ref symbols, .. }) => {
                 if let Some(index) = symbols.iter().position(|item| item == s) {
                     encode_int(index as i32, writer)
@@ -364,6 +413,90 @@ pub(crate) mod tests {
             "Value: {:?}\n should encode with schema:\n{:?}",
             &value, &schema
         )
+    }
+
+    #[test]
+    fn test_zig_i32_i64_same_number() {
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        zig_i32(42i32, &mut a).unwrap();
+        zig_i64(42i64, &mut b).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_zig_i64() {
+        let mut s = Vec::new();
+
+        zig_i64(0, &mut s).unwrap();
+        assert_eq!(s, [0]);
+
+        s.clear();
+        zig_i64(-1, &mut s).unwrap();
+        assert_eq!(s, [1]);
+
+        s.clear();
+        zig_i64(1, &mut s).unwrap();
+        assert_eq!(s, [2]);
+
+        s.clear();
+        zig_i64(-64, &mut s).unwrap();
+        assert_eq!(s, [127]);
+
+        s.clear();
+        zig_i64(64, &mut s).unwrap();
+        assert_eq!(s, [128, 1]);
+
+        s.clear();
+        zig_i64(i32::MAX as i64, &mut s).unwrap();
+        assert_eq!(s, [254, 255, 255, 255, 15]);
+
+        s.clear();
+        zig_i64(i32::MAX as i64 + 1, &mut s).unwrap();
+        assert_eq!(s, [128, 128, 128, 128, 16]);
+
+        s.clear();
+        zig_i64(i32::MIN as i64, &mut s).unwrap();
+        assert_eq!(s, [255, 255, 255, 255, 15]);
+
+        s.clear();
+        zig_i64(i32::MIN as i64 - 1, &mut s).unwrap();
+        assert_eq!(s, [129, 128, 128, 128, 16]);
+
+        s.clear();
+        zig_i64(i64::MAX, &mut s).unwrap();
+        assert_eq!(s, [254, 255, 255, 255, 255, 255, 255, 255, 255, 1]);
+
+        s.clear();
+        zig_i64(i64::MIN, &mut s).unwrap();
+        assert_eq!(s, [255, 255, 255, 255, 255, 255, 255, 255, 255, 1]);
+    }
+
+    #[test]
+    fn test_zig_i32() {
+        let mut s = Vec::new();
+        zig_i32(i32::MAX / 2, &mut s).unwrap();
+        assert_eq!(s, [254, 255, 255, 255, 7]);
+
+        s.clear();
+        zig_i32(i32::MIN / 2, &mut s).unwrap();
+        assert_eq!(s, [255, 255, 255, 255, 7]);
+
+        s.clear();
+        zig_i32(-(i32::MIN / 2), &mut s).unwrap();
+        assert_eq!(s, [128, 128, 128, 128, 8]);
+
+        s.clear();
+        zig_i32(i32::MIN / 2 - 1, &mut s).unwrap();
+        assert_eq!(s, [129, 128, 128, 128, 8]);
+
+        s.clear();
+        zig_i32(i32::MAX, &mut s).unwrap();
+        assert_eq!(s, [254, 255, 255, 255, 15]);
+
+        s.clear();
+        zig_i32(i32::MIN, &mut s).unwrap();
+        assert_eq!(s, [255, 255, 255, 255, 15]);
     }
 
     #[test]
@@ -937,7 +1070,7 @@ pub(crate) mod tests {
     #[test]
     fn test_avro_3585_encode_uuids() {
         let value = Value::String(String::from("00000000-0000-0000-0000-000000000000"));
-        let schema = Schema::Uuid;
+        let schema = Schema::Uuid(UuidSchema::String);
         let mut buffer = Vec::new();
         let encoded = encode(&value, &schema, &mut buffer);
         assert!(encoded.is_ok());
